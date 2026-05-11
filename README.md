@@ -1,0 +1,49 @@
+# Excel to PowerPoint Dashboard App
+
+A Streamlit app that converts an uploaded Excel workbook into a PowerPoint deck.
+
+What it does:
+
+1. User uploads an `.xlsx` file.
+2. The app sets each worksheet to fit on one landscape page.
+3. LibreOffice renders the workbook to PDF.
+4. The app converts each PDF page into a clean screenshot.
+5. It builds a PowerPoint with one slide per worksheet.
+6. It keeps an optional first slide from an uploaded PowerPoint template.
+7. It places the BYU Marriott logo in a right sidebar without blocking the data.
+
+## Local setup
+
+```bash
+pip install -r requirements.txt
+```
+
+You also need LibreOffice installed:
+
+- macOS: install LibreOffice from libreoffice.org, or with Homebrew: `brew install --cask libreoffice`
+- Windows: install LibreOffice and make sure `soffice.exe` is on PATH
+- Linux/Streamlit Cloud: `packages.txt` installs it
+
+Run:
+
+```bash
+streamlit run app.py
+```
+
+## Streamlit Cloud deployment
+
+Upload these files to GitHub:
+
+- `app.py`
+- `requirements.txt`
+- `packages.txt`
+- `.streamlit/config.toml`
+- `assets/default_logo.png`
+
+Then deploy the repo on Streamlit Cloud.
+
+## Notes
+
+- For best results, use `.xlsx` files with dashboard sheets already formatted similarly to your placement report workbook.
+- Uploading a PowerPoint template is optional. When uploaded, the app uses the first slide as the intro slide.
+- If you do not upload a logo, the app uses `assets/default_logo.png`.
