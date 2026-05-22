@@ -1,15 +1,19 @@
 import io
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
+from datetime import date, datetime
+from numbers import Number
 
 import fitz  # PyMuPDF
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import from_excel
 from openpyxl.worksheet.page import PageMargins
 from PIL import Image, ImageChops, ImageDraw
 from pptx import Presentation
@@ -52,12 +56,237 @@ def sanitize_filename(name: str) -> str:
     return "".join(ch if ch in allowed else "_" for ch in name).strip() or "file"
 
 
+CELL_RANGE_RE = re.compile(
+    r"(?P<sheet>'(?:[^']|'')+'|[^!]+)!"
+    r"\$?(?P<start_col>[A-Z]{1,3})\$?(?P<start_row>\d+)"
+    r"(?::\$?(?P<end_col>[A-Z]{1,3})\$?(?P<end_row>\d+))?"
+)
+
+
+def parse_excel_date(value) -> date | None:
+    """Return a Python date when a cell contains an Excel date or date-looking text."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    # Some workbooks store dates as Excel serial numbers. Keep the bounds
+    # conservative so normal dashboard counts are not accidentally treated as dates.
+    if isinstance(value, Number) and 25000 <= float(value) <= 90000:
+        try:
+            converted = from_excel(value)
+            return converted.date() if isinstance(converted, datetime) else converted
+        except Exception:
+            pass
+
+    if isinstance(value, str):
+        text = value.strip()
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%m-%d-%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                pass
+    return None
+
+def unquote_sheet_name(name: str) -> str:
+    if name.startswith("'") and name.endswith("'"):
+        return name[1:-1].replace("''", "'")
+    return name
+
+
+def quote_sheet_name(name: str) -> str:
+    return "'" + name.replace("'", "''") + "'" if any(ch in name for ch in " !'()") else name
+
+
+def get_horizontal_range_parts(formula: str):
+    """Parse formulas like NittyGrittySheet!$B$23:$AE$23.
+
+    Returns None unless the reference is a single horizontal row range.
+    """
+    if not formula:
+        return None
+    match = CELL_RANGE_RE.search(formula)
+    if not match:
+        return None
+
+    start_row = int(match.group("start_row"))
+    end_row = int(match.group("end_row") or match.group("start_row"))
+    if start_row != end_row:
+        return None
+
+    from openpyxl.utils import column_index_from_string
+
+    sheet_name = unquote_sheet_name(match.group("sheet"))
+    start_col = column_index_from_string(match.group("start_col"))
+    end_col = column_index_from_string(match.group("end_col") or match.group("start_col"))
+    return sheet_name, start_row, start_col, end_col
+
+
+def make_horizontal_range_formula(sheet_name: str, row: int, start_col: int, end_col: int) -> str:
+    from openpyxl.utils import get_column_letter
+
+    quoted = quote_sheet_name(sheet_name)
+    return f"{quoted}!${get_column_letter(start_col)}${row}:${get_column_letter(end_col)}${row}"
+
+
+def clear_chart_reference_cache(ref_obj) -> None:
+    """Force Excel/LibreOffice to rebuild chart caches from the updated source range."""
+    if not ref_obj:
+        return
+    for attr in ("numCache", "strCache", "multiLvlStrCache"):
+        if hasattr(ref_obj, attr):
+            try:
+                setattr(ref_obj, attr, None)
+            except Exception:
+                pass
+
+
+def latest_date_col_for_row(
+    ws,
+    row: int,
+    start_col: int,
+    end_col_hint: int | None = None,
+    cap_at_today: bool = False,
+) -> tuple[int | None, date | None]:
+    """Find the newest date column in a horizontal date row.
+
+    By default this uses the latest date that exists in the uploaded workbook,
+    even if that date is later than the date when the app code was written. This
+    is what makes the app work for future weekly updates like 5/22, 5/29, 6/5,
+    and so on.
+
+    If cap_at_today=True, it ignores dates after the server's current date. Use
+    that only when the workbook has blank placeholder columns for future weeks.
+    """
+    max_col = max(ws.max_column, end_col_hint or 0)
+    dated_cols: list[tuple[date, int]] = []
+
+    for col in range(start_col, max_col + 1):
+        cell_date = parse_excel_date(ws.cell(row=row, column=col).value)
+        if not cell_date:
+            continue
+        if cap_at_today and cell_date > date.today():
+            continue
+        dated_cols.append((cell_date, col))
+
+    if not dated_cols:
+        return None, None
+
+    latest_date, latest_col = max(dated_cols, key=lambda item: item[0])
+    return latest_col, latest_date
+
+def latest_used_col_for_row(ws, row: int, start_col: int, end_col_hint: int | None = None) -> int | None:
+    max_col = max(ws.max_column, end_col_hint or 0)
+    latest = None
+    for col in range(start_col, max_col + 1):
+        value = ws.cell(row=row, column=col).value
+        if value not in (None, ""):
+            latest = col
+    return latest
+
+
+def update_ref_formula_to_end_col(ref_obj, target_end_col: int | None) -> bool:
+    if not ref_obj or not getattr(ref_obj, "f", None) or not target_end_col:
+        return False
+
+    parts = get_horizontal_range_parts(ref_obj.f)
+    if not parts:
+        return False
+
+    sheet_name, row, start_col, current_end_col = parts
+    if target_end_col <= current_end_col:
+        # Still clear stale caches, because cached chart data can make LibreOffice
+        # render old points even when the workbook data is newer.
+        clear_chart_reference_cache(ref_obj)
+        return False
+
+    ref_obj.f = make_horizontal_range_formula(sheet_name, row, start_col, target_end_col)
+    clear_chart_reference_cache(ref_obj)
+    return True
+
+
+def extend_charts_to_latest_available_date(wb, cap_at_today: bool = False) -> tuple[int, date | None]:
+    """Extend horizontal chart ranges to the newest date in the uploaded workbook.
+
+    This fixes the exact problem where the Excel file contains a newer weekly
+    pull date, but the saved chart range still ends at an older date. The app now
+    scans the chart's category/date row and extends the category and value ranges
+    to the newest date it finds. Nothing is hardcoded to 5/15, 5/22, or any other
+    specific date.
+    """
+    updates = 0
+    newest_date_seen: date | None = None
+
+    # Ask Excel/LibreOffice to rebuild formulas and chart caches during render.
+    try:
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+    except Exception:
+        pass
+
+    for chart_ws in wb.worksheets:
+        for chart in getattr(chart_ws, "_charts", []):
+            for series in getattr(chart, "series", []):
+                target_end_col = None
+
+                # Prefer the category/date row because it controls the weekly x-axis.
+                cat = getattr(series, "cat", None)
+                cat_refs = []
+                if cat is not None:
+                    cat_refs.extend([getattr(cat, "strRef", None), getattr(cat, "numRef", None)])
+
+                for cat_ref in cat_refs:
+                    if not cat_ref or not getattr(cat_ref, "f", None):
+                        continue
+                    parts = get_horizontal_range_parts(cat_ref.f)
+                    if not parts:
+                        continue
+                    sheet_name, row, start_col, end_col = parts
+                    if sheet_name not in wb.sheetnames:
+                        continue
+                    target_end_col, latest_seen = latest_date_col_for_row(
+                        wb[sheet_name],
+                        row,
+                        start_col,
+                        end_col_hint=end_col,
+                        cap_at_today=cap_at_today,
+                    )
+                    if latest_seen and (newest_date_seen is None or latest_seen > newest_date_seen):
+                        newest_date_seen = latest_seen
+                    if target_end_col:
+                        updates += int(update_ref_formula_to_end_col(cat_ref, target_end_col))
+                        break
+
+                # Extend each value series to the same final column as its date row.
+                val = getattr(series, "val", None)
+                val_ref = getattr(val, "numRef", None) if val is not None else None
+                if val_ref and getattr(val_ref, "f", None):
+                    if not target_end_col:
+                        parts = get_horizontal_range_parts(val_ref.f)
+                        if parts:
+                            sheet_name, row, start_col, end_col = parts
+                            if sheet_name in wb.sheetnames:
+                                target_end_col = latest_used_col_for_row(
+                                    wb[sheet_name], row, start_col, end_col_hint=end_col
+                                )
+                    updates += int(update_ref_formula_to_end_col(val_ref, target_end_col))
+
+                # Clear title caches too, just in case LibreOffice uses stale chart XML.
+                tx = getattr(series, "tx", None)
+                tx_ref = getattr(tx, "strRef", None) if tx is not None else None
+                clear_chart_reference_cache(tx_ref)
+
+    return updates, newest_date_seen
+
 def prepare_workbook_for_rendering(
     source_xlsx: Path,
     output_xlsx: Path,
     include_sheets: list[str],
     fit_each_sheet_to_one_page: bool,
     margins: float,
+    auto_extend_latest_date: bool,
+    cap_chart_dates_at_today: bool,
 ) -> list[str]:
     """Copy workbook, hide excluded sheets, and set print layout."""
     wb = load_workbook(source_xlsx)
@@ -105,6 +334,9 @@ def prepare_workbook_for_rendering(
             ws.page_setup.fitToWidth = 1
             ws.page_setup.fitToHeight = 1
             ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    if auto_extend_latest_date:
+        extend_charts_to_latest_available_date(wb, cap_at_today=cap_chart_dates_at_today)
 
     wb.save(output_xlsx)
     return visible_sheets
@@ -379,6 +611,8 @@ def convert_excel_to_pptx(
     dpi: int,
     sidebar_width: float,
     margins: float,
+    auto_extend_latest_date: bool,
+    cap_chart_dates_at_today: bool,
 ) -> tuple[bytes, bytes, str]:
     soffice_path = find_soffice()
     if not soffice_path:
@@ -412,6 +646,8 @@ def convert_excel_to_pptx(
             selected_sheets,
             fit_each_sheet_to_one_page,
             margins,
+            auto_extend_latest_date,
+            cap_chart_dates_at_today,
         )
 
         pdf_path = convert_to_pdf(prepared_xlsx, tmpdir / "pdf", soffice_path)
@@ -471,6 +707,32 @@ def get_sheet_names_from_upload(uploaded_excel) -> list[str]:
             pass
 
 
+
+
+def get_newest_date_from_upload(uploaded_excel) -> date | None:
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp.write(uploaded_excel.getbuffer())
+        tmp_path = Path(tmp.name)
+    try:
+        wb = load_workbook(tmp_path, read_only=True, data_only=False)
+        newest = None
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    parsed = parse_excel_date(cell.value)
+                    if parsed and (newest is None or parsed > newest):
+                        newest = parsed
+        return newest
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def format_date_for_display(value: date) -> str:
+    return f"{value.month}/{value.day}/{value.year}"
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 
@@ -487,6 +749,16 @@ def main() -> None:
         dpi = st.slider("Screenshot resolution", min_value=120, max_value=260, value=190, step=10)
         sidebar_width = st.slider("Right logo sidebar width", min_value=0.8, max_value=1.6, value=1.2, step=0.05)
         margins = st.slider("Excel print margins", min_value=0.05, max_value=0.40, value=0.20, step=0.05)
+        auto_extend_latest_date = st.checkbox(
+            "Auto-extend charts to newest workbook date",
+            value=True,
+            help="Uses the newest date found in the uploaded workbook, so future pulls like 5/22, 5/29, 6/5, etc. are included automatically.",
+        )
+        cap_chart_dates_at_today = st.checkbox(
+            "Ignore dates after today",
+            value=False,
+            help="Leave this off for normal use. Turn it on only if your workbook contains blank future placeholder dates that should not appear yet.",
+        )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -508,6 +780,10 @@ def main() -> None:
     except Exception as exc:
         st.error(f"Could not read the workbook: {exc}")
         return
+
+    newest_workbook_date = get_newest_date_from_upload(excel_upload)
+    if newest_workbook_date:
+        st.info(f"Newest date detected in this workbook: **{format_date_for_display(newest_workbook_date)}**")
 
     st.subheader("Sheets to include")
     default_sheets = sheet_names
@@ -535,6 +811,8 @@ def main() -> None:
                     dpi=dpi,
                     sidebar_width=sidebar_width,
                     margins=margins,
+                    auto_extend_latest_date=auto_extend_latest_date,
+                    cap_chart_dates_at_today=cap_chart_dates_at_today,
                 )
 
             st.success("PowerPoint created successfully.")
