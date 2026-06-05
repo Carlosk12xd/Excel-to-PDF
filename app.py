@@ -9,10 +9,12 @@ from pathlib import Path
 from datetime import date, datetime
 from numbers import Number
 import math
+import logging
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 from matplotlib.ticker import FuncFormatter
 
 import fitz  # PyMuPDF
@@ -854,21 +856,25 @@ def render_rebuilt_line_chart(
     tick_indices = make_tick_indices(len(dates), max_ticks=max_axis_labels)
     ax.set_xticks(tick_indices)
 
-    # Keep the original-style m/d/yyyy labels, anchored directly to their
-    # corresponding data points. rotation_mode="anchor" keeps the label's
-    # right edge attached to the tick, matching Excel/LibreOffice more closely.
-    x_label_font = 6.1 if len(tick_indices) <= 18 else 5.6
+    # Keep the original-style m/d/yyyy labels, but center every label on an
+    # actual weekly data point. This fixes the newest date looking shifted left
+    # or right compared with the other labels.
+    x_label_font = 6.0 if len(tick_indices) <= 18 else 5.5
     ax.set_xticklabels(
         [date_label(dates[i]) for i in tick_indices],
         rotation=45,
-        rotation_mode="anchor",
-        ha="right",
+        rotation_mode="default",
+        ha="center",
         va="top",
         fontsize=x_label_font,
         color="#595959",
     )
     if dates:
-        ax.set_xlim(-0.5, len(dates) - 0.5)
+        # Add a small category margin so the first and latest labels can remain
+        # centered under their ticks without clipping or appearing off-center.
+        ax.set_xlim(-0.7, len(dates) - 0.3)
+    for tick_label in ax.get_xticklabels():
+        tick_label.set_clip_on(False)
 
     # Match the compact Excel chart look instead of large Matplotlib defaults.
     ax.set_title(title, fontsize=10.2, color="#595959", pad=6, loc="left", fontweight="normal")
@@ -1073,13 +1079,19 @@ def convert_excel_to_pptx(
             intro_template = save_upload(uploaded_intro_pptx, tmpdir / sanitize_filename(uploaded_intro_pptx.name))
 
         prepared_xlsx = tmpdir / "prepared_dashboard.xlsx"
+        # When weekly charts are rebuilt from NittyGrittySheet, do not also
+        # rewrite the workbook's native chart XML. That legacy chart-range
+        # repair can make unrelated Excel-rendered charts on other slides look
+        # broken. The rebuilt weekly overlays already guarantee the newest date.
+        should_auto_extend_native_charts = auto_extend_latest_date and not rebuild_weekly_charts
+
         rendered_sheet_names = prepare_workbook_for_rendering(
             excel_path,
             prepared_xlsx,
             selected_sheets,
             fit_each_sheet_to_one_page,
             margins,
-            auto_extend_latest_date,
+            should_auto_extend_native_charts,
             cap_chart_dates_at_today,
         )
 
@@ -1201,9 +1213,9 @@ def main() -> None:
         sidebar_width = st.slider("Right logo sidebar width", min_value=0.8, max_value=1.6, value=1.2, step=0.05)
         margins = st.slider("Excel print margins", min_value=0.05, max_value=0.40, value=0.20, step=0.05)
         auto_extend_latest_date = st.checkbox(
-            "Auto-extend charts to newest workbook date",
-            value=True,
-            help="Uses the newest date found in the uploaded workbook, so future pulls like 5/22, 5/29, 6/5, etc. are included automatically.",
+            "Legacy native Excel chart range repair",
+            value=False,
+            help="Usually leave this OFF. The app now rebuilds weekly charts from NittyGrittySheet, which is safer. Turn this on only for older workbooks where you want the app to edit the workbook's native chart ranges before LibreOffice renders them.",
         )
         cap_chart_dates_at_today = st.checkbox(
             "Ignore dates after today",
@@ -1213,7 +1225,7 @@ def main() -> None:
         rebuild_weekly_charts = st.checkbox(
             "Rebuild weekly charts from NittyGrittySheet",
             value=True,
-            help="Recommended. Forces weekly placement and search-status charts to end on the newest date in the uploaded workbook instead of relying on stale Excel chart rendering.",
+            help="Recommended. Replaces only the two top weekly charts with fresh charts from NittyGrittySheet, while leaving the other Excel-rendered charts alone.",
         )
         weekly_axis_label_count = st.slider(
             "Weekly x-axis date labels",
