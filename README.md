@@ -71,3 +71,13 @@ Keep **Rebuild weekly charts from NittyGrittySheet** turned on for placement das
 This version also supports a rolling weekly-chart window. Keep **Rebuild weekly charts from NittyGrittySheet** turned on and use **Weekly chart window: newest date plus previous pulls**. The app rebuilds the two top weekly charts from workbook data and uses the newest date found in the uploaded file as the rightmost point. For example, if the uploaded workbook includes `6/5/2026`, the rebuilt weekly charts end at `6/5/2026`; if the next upload includes `6/12/2026`, they end at `6/12/2026`.
 
 Recommended setting: `10`, which shows the newest pull plus the previous weekly pulls, roughly the last two months.
+
+## Full weekly timeline with endpoint labels
+
+The weekly charts now keep the full available timeline from the original starting date through the newest workbook date. The x-axis labels always include:
+
+- the original starting date
+- the most recent workbook date
+- evenly spaced dates in between
+
+Use **Weekly x-axis date labels** to control how many labels appear. The data line still includes every weekly pull; the setting only controls which dates are printed on the x-axis so the chart remains readable.

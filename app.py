@@ -745,23 +745,20 @@ def extract_horizontal_weekly_series(
 
 
 
-def tail_weekly_series(
+def full_weekly_series(
     dates: list[date],
     values: list[float | None],
-    max_points: int,
 ) -> tuple[list[date], list[float | None]]:
-    """Return the newest date plus the previous dates.
+    """Return the full weekly series from the original start date to the newest date.
 
-    This is intentionally based on the actual uploaded workbook data, not a
-    hardcoded date. If the workbook contains 6/5/2026, the returned window ends
-    on 6/5/2026. If a future workbook contains 6/12/2026, it ends there.
+    The rebuilt charts should not drop older points just because the newest pull
+    moved forward. This guarantees the x-axis can show the original starting
+    date, representative dates in between, and the most recent workbook date.
     """
     pairs: dict[date, float | None] = {}
     for d, v in zip(dates, values):
         pairs[d] = v
     items = sorted(pairs.items(), key=lambda item: item[0])
-    if max_points and max_points > 0:
-        items = items[-max_points:]
     return [d for d, _ in items], [v for _, v in items]
 
 
@@ -772,21 +769,28 @@ def series_to_date_value_map(dates: list[date], values: list[float]) -> dict[dat
     return mapped
 
 
-def newest_date_window(date_lists: list[list[date]], max_points: int) -> list[date]:
-    """Build one shared x-axis ending at the newest date found."""
-    all_dates = sorted({d for dates in date_lists for d in dates})
-    if max_points and max_points > 0:
-        all_dates = all_dates[-max_points:]
-    return all_dates
+def full_date_axis(date_lists: list[list[date]]) -> list[date]:
+    """Build one shared x-axis from the original start date to the newest date."""
+    return sorted({d for dates in date_lists for d in dates})
 
-def make_tick_indices(total_points: int, max_ticks: int = 12) -> list[int]:
+def make_tick_indices(total_points: int, max_ticks: int = 10) -> list[int]:
+    """Pick x-axis labels that always include the first and last dates.
+
+    The chart keeps every data point, but the axis only labels a readable subset:
+    original starting date, most recent date, and evenly spaced dates in between.
+    This is intentionally deterministic rather than truly random so repeated
+    exports of the same workbook look consistent.
+    """
+    if total_points <= 0:
+        return []
     if total_points <= max_ticks:
         return list(range(total_points))
-    step = max(1, math.ceil(total_points / (max_ticks - 1)))
-    indices = list(range(0, total_points, step))
-    if indices[-1] != total_points - 1:
-        indices.append(total_points - 1)
-    return sorted(set(indices))
+    max_ticks = max(2, max_ticks)
+    indices = {0, total_points - 1}
+    for i in range(1, max_ticks - 1):
+        idx = round(i * (total_points - 1) / (max_ticks - 1))
+        indices.add(idx)
+    return sorted(indices)
 
 
 def date_label(d: date) -> str:
@@ -802,29 +806,70 @@ def render_rebuilt_line_chart(
     percent_axis: bool,
     width_px: int,
     height_px: int,
+    max_axis_labels: int = 10,
 ) -> Path:
+    """Draw an Excel-style weekly line chart.
+
+    The rebuilt charts intentionally use smaller Excel-like typography and fixed
+    figure dimensions. That keeps labels/legends from growing, shifting, or
+    covering the chart when the image is pasted back over the worksheet.
+    """
     dpi = 160
     fig_w = max(width_px / dpi, 3.0)
     fig_h = max(height_px / dpi, 1.8)
+
+    # Excel/PowerPoint-like font fallback. Calibri may not exist on Streamlit
+    # Cloud, so Arial/DejaVu Sans are safe fallbacks.
+    plt.rcParams.update({
+        "font.family": ["Calibri", "Arial", "DejaVu Sans", "sans-serif"],
+        "axes.edgecolor": "#D9D9D9",
+        "axes.linewidth": 0.8,
+    })
+
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
 
     x = list(range(len(dates)))
-    for label, values in series.items():
+    excel_colors = ["#156082", "#E97132", "#0F9ED5", "#70AD47", "#A5A5A5", "#7030A0"]
+    for idx, (label, values) in enumerate(series.items()):
         # Matplotlib will leave a gap for missing values, but the x-axis will
         # still include the newest workbook date.
-        ax.plot(x, values, marker="o", linewidth=2.2, markersize=4.2, label=label)
+        ax.plot(
+            x,
+            values,
+            marker="o",
+            linewidth=1.7,
+            markersize=3.2,
+            label=label,
+            color=excel_colors[idx % len(excel_colors)],
+        )
 
-    tick_indices = make_tick_indices(len(dates), max_ticks=11)
+    tick_indices = make_tick_indices(len(dates), max_ticks=max_axis_labels)
     ax.set_xticks(tick_indices)
-    ax.set_xticklabels([date_label(dates[i]) for i in tick_indices], rotation=45, ha="right", fontsize=7.5)
+
+    # Keep the original-style m/d/yyyy labels, but make them small enough to fit.
+    # More labels = slightly smaller font so dates do not cover the plot.
+    x_label_font = 6.4 if len(tick_indices) <= 10 else 5.8
+    ax.set_xticklabels(
+        [date_label(dates[i]) for i in tick_indices],
+        rotation=45,
+        ha="right",
+        fontsize=x_label_font,
+        color="#595959",
+    )
     if dates:
         ax.set_xlim(-0.5, len(dates) - 0.5)
-    ax.set_title(title, fontsize=12, color="#555555", pad=8)
-    ax.set_ylabel(y_label, fontsize=8.5, color="#555555")
-    ax.grid(axis="y", alpha=0.28)
+
+    # Match the compact Excel chart look instead of large Matplotlib defaults.
+    ax.set_title(title, fontsize=10.2, color="#595959", pad=6, loc="left", fontweight="normal")
+    ax.set_ylabel(y_label, fontsize=7.2, color="#595959")
+    ax.grid(axis="y", color="#D9D9D9", linewidth=0.7)
+    ax.grid(axis="x", visible=False)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.tick_params(axis="y", labelsize=7.5)
+    ax.spines["left"].set_color("#D9D9D9")
+    ax.spines["bottom"].set_color("#D9D9D9")
+    ax.tick_params(axis="y", labelsize=6.7, colors="#595959", length=0)
+    ax.tick_params(axis="x", colors="#595959", length=0)
 
     if percent_axis:
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0%}"))
@@ -838,15 +883,30 @@ def render_rebuilt_line_chart(
             top = max(all_values) * 1.18
             ax.set_ylim(0, top if top > 0 else 1)
 
+    # Put the legend in the bottom margin, not over the lines or date labels.
     if len(series) > 1:
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.25), ncol=min(3, len(series)), fontsize=7, frameon=False)
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.27),
+            ncol=min(3, len(series)),
+            fontsize=6.3,
+            frameon=False,
+            handlelength=1.6,
+            handletextpad=0.35,
+            columnspacing=0.8,
+            borderaxespad=0.0,
+        )
+        fig.subplots_adjust(left=0.09, right=0.985, top=0.84, bottom=0.34)
+    else:
+        fig.subplots_adjust(left=0.09, right=0.985, top=0.84, bottom=0.26)
 
-    fig.tight_layout(pad=1.0)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, facecolor="white", bbox_inches="tight", pad_inches=0.08)
+    # Do NOT use bbox_inches="tight" here. Tight bounding boxes change the final
+    # image dimensions and can make labels/legends scale unexpectedly when pasted
+    # back into the worksheet screenshot.
+    fig.savefig(output_path, facecolor="white", dpi=dpi)
     plt.close(fig)
     return output_path
-
 
 def paste_chart(image: Image.Image, chart_path: Path, box: tuple[int, int, int, int]) -> None:
     left, top, right, bottom = box
@@ -864,7 +924,7 @@ def rebuild_weekly_charts_on_sheet_image(
     prepared_workbook_path: Path,
     sheet_name: str,
     working_dir: Path,
-    weekly_window_points: int = 10,
+    weekly_axis_label_count: int = 10,
 ) -> Path:
     """Replace stale Excel-rendered weekly charts with freshly drawn charts.
 
@@ -872,7 +932,7 @@ def rebuild_weekly_charts_on_sheet_image(
     show a chart that visually stops at an older tick label even after formulas
     are extended. This function reads the newest weekly data directly from
     NittyGrittySheet and pastes newly rendered chart images over the two top
-    weekly charts, guaranteeing the newest workbook date appears on the x-axis.
+    weekly charts, guaranteeing the original starting date and newest workbook date both appear on the x-axis.
     """
     wb = load_workbook(prepared_workbook_path, data_only=True)
     rows = find_weekly_block_rows(wb, sheet_name)
@@ -884,7 +944,7 @@ def rebuild_weekly_charts_on_sheet_image(
     ws = wb["NittyGrittySheet"]
 
     placement_dates, placement_values = extract_horizontal_weekly_series(ws, date_row, placement_value_row)
-    placement_dates, placement_values = tail_weekly_series(placement_dates, placement_values, weekly_window_points)
+    placement_dates, placement_values = full_weekly_series(placement_dates, placement_values)
     if len(placement_dates) < 2:
         image_path.replace(output_path) if image_path != output_path else None
         return output_path if output_path.exists() else image_path
@@ -897,7 +957,7 @@ def rebuild_weekly_charts_on_sheet_image(
             status_maps[label] = series_to_date_value_map(dts, vals)
             status_date_lists.append(dts)
 
-    status_dates = newest_date_window(status_date_lists, weekly_window_points) if status_date_lists else []
+    status_dates = full_date_axis(status_date_lists) if status_date_lists else []
     status_series: dict[str, list[float | None]] = {
         label: [mapped.get(d) for d in status_dates]
         for label, mapped in status_maps.items()
@@ -931,6 +991,7 @@ def rebuild_weekly_charts_on_sheet_image(
         True,
         left_chart_box[2] - left_chart_box[0],
         left_chart_box[3] - left_chart_box[1],
+        max_axis_labels=weekly_axis_label_count,
     )
     paste_chart(image, placement_chart, left_chart_box)
 
@@ -945,6 +1006,7 @@ def rebuild_weekly_charts_on_sheet_image(
             False,
             right_chart_box[2] - right_chart_box[0],
             right_chart_box[3] - right_chart_box[1],
+            max_axis_labels=weekly_axis_label_count,
         )
         paste_chart(image, status_chart, right_chart_box)
 
@@ -968,7 +1030,7 @@ def convert_excel_to_pptx(
     auto_extend_latest_date: bool,
     cap_chart_dates_at_today: bool,
     rebuild_weekly_charts: bool,
-    weekly_window_points: int,
+    weekly_axis_label_count: int,
 ) -> tuple[bytes, bytes, str]:
     soffice_path = find_soffice()
     if not soffice_path:
@@ -1034,7 +1096,7 @@ def convert_excel_to_pptx(
                         prepared_xlsx,
                         sheet_name,
                         tmpdir,
-                        weekly_window_points=weekly_window_points,
+                        weekly_axis_label_count=weekly_axis_label_count,
                     )
                 except Exception:
                     # Keep the normal Excel screenshot if a workbook does not use
@@ -1138,13 +1200,13 @@ def main() -> None:
             value=True,
             help="Recommended. Forces weekly placement and search-status charts to end on the newest date in the uploaded workbook instead of relying on stale Excel chart rendering.",
         )
-        weekly_window_points = st.slider(
-            "Weekly chart window: newest date plus previous pulls",
-            min_value=6,
-            max_value=16,
+        weekly_axis_label_count = st.slider(
+            "Weekly x-axis date labels",
+            min_value=4,
+            max_value=14,
             value=10,
             step=1,
-            help="The rebuilt weekly charts will always include the newest workbook date and this many total weekly pulls. Use 10 for roughly the last two months.",
+            help="The rebuilt weekly charts keep the full timeline from the original starting date to the newest workbook date. This controls how many date labels appear: first date, newest date, and evenly spaced dates in between.",
         )
 
     col1, col2 = st.columns(2)
@@ -1201,7 +1263,7 @@ def main() -> None:
                     auto_extend_latest_date=auto_extend_latest_date,
                     cap_chart_dates_at_today=cap_chart_dates_at_today,
                     rebuild_weekly_charts=rebuild_weekly_charts,
-                    weekly_window_points=weekly_window_points,
+                    weekly_axis_label_count=weekly_axis_label_count,
                 )
 
             st.success("PowerPoint created successfully.")
