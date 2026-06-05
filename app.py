@@ -1,4 +1,3 @@
-import re
 import shutil
 import subprocess
 import tempfile
@@ -6,12 +5,14 @@ import zipfile
 from pathlib import Path
 
 import streamlit as st
+from PIL import Image, ImageChops, ImageDraw, ImageFont
+from pptx import Presentation
+from pptx.util import Inches
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.page import PageMargins
-from PIL import Image, ImageChops, ImageDraw, ImageFont
 
-APP_TITLE = "Excel Screenshot to PDF Builder"
+APP_TITLE = "Excel Direct Screenshot Export Builder"
 DEFAULT_LOGO = Path("assets/default_logo.png")
 
 PAGE_W = 1920
@@ -27,34 +28,12 @@ TITLE_COLOR = (16, 49, 101)
 TEXT_COLOR = (45, 45, 45)
 
 
-def flatten_to_rgb(image: Image.Image, background=(255, 255, 255)) -> Image.Image:
-    """Return an RGB image, safely flattening transparency onto a white background.
-
-    Pillow's PDF writer expects RGB/CMYK/L images. Uploaded logos and PNGs often
-    arrive as RGBA, LA, or P-with-transparency images; passing those through can
-    raise errors like "image has wrong mode." This helper normalizes every image
-    before PDF export or compositing.
-    """
-    if image.mode == "RGB":
-        return image
-    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
-        rgba = image.convert("RGBA")
-        bg = Image.new("RGBA", rgba.size, background + (255,))
-        bg.alpha_composite(rgba)
-        return bg.convert("RGB")
-    return image.convert("RGB")
-
-
-def paste_transparent(base: Image.Image, overlay: Image.Image, xy: tuple[int, int]) -> Image.Image:
-    """Safely paste a transparent PNG/logo onto an RGB page.
-
-    This avoids Pillow mode/mask issues by doing the composite in RGBA mode and
-    then converting back to RGB for PDF output.
-    """
-    base_rgba = base.convert("RGBA")
-    overlay_rgba = overlay.convert("RGBA")
-    base_rgba.alpha_composite(overlay_rgba, dest=(int(xy[0]), int(xy[1])))
-    return base_rgba.convert("RGB")
+def find_executable(names: list[str]) -> str | None:
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 def find_soffice() -> str | None:
@@ -64,18 +43,6 @@ def find_soffice() -> str | None:
         r"C:\\Program Files\\LibreOffice\\program\\soffice.exe",
         r"C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
         "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return str(candidate)
-    return None
-
-
-def find_pdftoppm() -> str | None:
-    candidates = [
-        shutil.which("pdftoppm"),
-        r"C:\\Program Files\\poppler\\Library\\bin\\pdftoppm.exe",
-        r"C:\\poppler\\Library\\bin\\pdftoppm.exe",
     ]
     for candidate in candidates:
         if candidate and Path(candidate).exists():
@@ -108,30 +75,22 @@ def get_sheet_names_from_upload(uploaded_excel) -> list[str]:
             pass
 
 
-def prepare_workbook_for_rendering(
-    source_xlsx: Path,
-    output_xlsx: Path,
-    include_sheets: list[str],
-    fit_each_sheet_to_one_page: bool,
-    margins: float,
-) -> list[str]:
+def prepare_workbook_for_rendering(source_xlsx: Path, output_xlsx: Path, include_sheets: list[str], margins: float) -> list[str]:
+    """Fallback mode only. This touches the workbook with openpyxl, so it is not as faithful as direct render."""
     wb = load_workbook(source_xlsx)
     visible_sheets = []
-
     for ws in wb.worksheets:
         if ws.title in include_sheets:
             ws.sheet_state = "visible"
             visible_sheets.append(ws.title)
         else:
             ws.sheet_state = "hidden"
-
     if not visible_sheets:
         raise ValueError("No sheets selected.")
 
     for ws in wb.worksheets:
         if ws.title not in visible_sheets:
             continue
-
         min_r = min_c = 10**9
         max_r = max_c = 0
         for row in ws.iter_rows():
@@ -141,47 +100,23 @@ def prepare_workbook_for_rendering(
                     min_c = min(min_c, cell.column)
                     max_r = max(max_r, cell.row)
                     max_c = max(max_c, cell.column)
-
         if max_r:
             ws.print_area = f"{get_column_letter(min_c)}{min_r}:{get_column_letter(max_c)}{max_r}"
-
         ws.page_setup.orientation = "landscape"
-        ws.page_margins = PageMargins(
-            left=margins,
-            right=margins,
-            top=margins,
-            bottom=margins,
-            header=0.1,
-            footer=0.1,
-        )
-
-        if fit_each_sheet_to_one_page:
-            ws.page_setup.fitToWidth = 1
-            ws.page_setup.fitToHeight = 1
-            ws.sheet_properties.pageSetUpPr.fitToPage = True
-
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 1
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.page_margins = PageMargins(left=margins, right=margins, top=margins, bottom=margins, header=0.1, footer=0.1)
     wb.save(output_xlsx)
     return visible_sheets
 
 
 def convert_to_pdf(input_file: Path, output_dir: Path, soffice_path: str) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        soffice_path,
-        "--headless",
-        "--convert-to",
-        "pdf",
-        "--outdir",
-        str(output_dir),
-        str(input_file),
-    ]
+    cmd = [soffice_path, "--headless", "--convert-to", "pdf", "--outdir", str(output_dir), str(input_file)]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
     if result.returncode != 0:
-        raise RuntimeError(
-            "LibreOffice failed to convert the file to PDF.\n\n"
-            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
-        )
-
+        raise RuntimeError("LibreOffice failed to convert the file to PDF.\n\n" + result.stderr)
     pdf_path = output_dir / f"{input_file.stem}.pdf"
     if not pdf_path.exists():
         pdfs = list(output_dir.glob("*.pdf"))
@@ -191,40 +126,17 @@ def convert_to_pdf(input_file: Path, output_dir: Path, soffice_path: str) -> Pat
     return pdf_path
 
 
-def _page_sort_key(path: Path) -> tuple[int, str]:
-    # pdftoppm names files like prefix-1.png, prefix-01.png, or prefix-001.png.
-    match = re.search(r"-(\d+)\.png$", path.name)
-    return (int(match.group(1)) if match else 10**9, path.name)
-
-
-def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int, first_page: int | None = None, last_page: int | None = None) -> list[Path]:
-    pdftoppm = find_pdftoppm()
+def pdf_to_images_poppler(pdf_path: Path, output_dir: Path, dpi: int) -> list[Path]:
+    pdftoppm = find_executable(["pdftoppm"])
     if not pdftoppm:
-        raise RuntimeError(
-            "Poppler was not found. Add poppler-utils to packages.txt on Streamlit Cloud, "
-            "or install Poppler locally."
-        )
-
+        raise RuntimeError("pdftoppm was not found. Add poppler-utils to packages.txt.")
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_prefix = output_dir / "page"
-    cmd = [pdftoppm, "-png", "-r", str(dpi)]
-    if first_page is not None:
-        cmd.extend(["-f", str(first_page)])
-    if last_page is not None:
-        cmd.extend(["-l", str(last_page)])
-    cmd.extend([str(pdf_path), str(output_prefix)])
-
+    prefix = output_dir / "page"
+    cmd = [pdftoppm, "-png", "-r", str(dpi), str(pdf_path), str(prefix)]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
     if result.returncode != 0:
-        raise RuntimeError(
-            "Poppler failed to render PDF pages.\n\n"
-            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
-        )
-
-    image_paths = sorted(output_dir.glob("page-*.png"), key=_page_sort_key)
-    if not image_paths:
-        raise FileNotFoundError("Poppler did not create any PNG page images.")
-    return image_paths
+        raise RuntimeError("Poppler failed to render the PDF pages.\n\n" + result.stderr)
+    return sorted(output_dir.glob("page-*.png"))
 
 
 def crop_white_space(image_path: Path, output_path: Path, threshold: int = 12, margin_px: int = 18) -> Path:
@@ -236,7 +148,6 @@ def crop_white_space(image_path: Path, output_path: Path, threshold: int = 12, m
     if bbox is None:
         image.save(output_path)
         return output_path
-
     left = max(0, bbox[0] - margin_px)
     top = max(0, bbox[1] - margin_px)
     right = min(image.width, bbox[2] + margin_px)
@@ -254,7 +165,7 @@ def resize_for_page(image_path: Path, output_path: Path, max_dimension: int = 26
     return output_path
 
 
-def ellipse_transparent_logo(source: Path, output: Path) -> Path:
+def transparent_circle_logo(source: Path, output: Path) -> Path:
     image = Image.open(source).convert("RGBA")
     mask = Image.new("L", image.size, 0)
     draw = ImageDraw.Draw(mask)
@@ -268,7 +179,6 @@ def ellipse_transparent_logo(source: Path, output: Path) -> Path:
 def load_font(size: int, bold: bool = False):
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
         "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
         "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
     ]
@@ -280,47 +190,44 @@ def load_font(size: int, bold: bool = False):
 
 def fit_text_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
     words = text.split()
-    if not words:
-        return [""]
-    lines = []
-    current = words[0]
-    for word in words[1:]:
-        test = f"{current} {word}"
-        width = draw.textbbox((0, 0), test, font=font)[2]
-        if width <= max_width:
+    lines, current = [], ""
+    for word in words:
+        test = word if not current else f"{current} {word}"
+        if draw.textbbox((0, 0), test, font=font)[2] <= max_width:
             current = test
         else:
-            lines.append(current)
+            if current:
+                lines.append(current)
             current = word
-    lines.append(current)
-    return lines
+    if current:
+        lines.append(current)
+    return lines or [""]
 
 
-def create_generated_intro_page(title: str, logo_path: Path | None) -> Image.Image:
+def make_intro_page(title: str, logo_path: Path | None) -> Image.Image:
     page = Image.new("RGB", (PAGE_W, PAGE_H), "white")
     draw = ImageDraw.Draw(page)
-    draw.rectangle((0, 0, PAGE_W, 95), fill=(16, 49, 101))
-    title_font = load_font(54, bold=True)
-    subtitle_font = load_font(28)
-    draw.text((120, 210), title, fill=TITLE_COLOR, font=title_font)
-    draw.text((120, 300), "Generated from the uploaded Excel workbook.", fill=TEXT_COLOR, font=subtitle_font)
+    draw.rectangle((0, 0, PAGE_W, 95), fill=TITLE_COLOR)
+    draw.text((120, 210), title, fill=TITLE_COLOR, font=load_font(54, bold=True))
+    draw.text((120, 300), "Generated from the uploaded Excel workbook.", fill=TEXT_COLOR, font=load_font(28))
     if logo_path and logo_path.exists():
         logo = Image.open(logo_path).convert("RGBA")
         logo.thumbnail((300, 300), Image.LANCZOS)
-        page = paste_transparent(page, logo, (1450, 150))
-    return flatten_to_rgb(page)
+        page.paste(logo.convert("RGB"), (1450, 150), logo)
+    return page
 
 
-def extract_intro_page(template_pptx: Path, working_dir: Path, soffice_path: str) -> Image.Image:
-    pdf_path = convert_to_pdf(template_pptx, working_dir / "template_pdf", soffice_path)
-    pages = pdf_to_images(pdf_path, working_dir / "template_pages", dpi=170, first_page=1, last_page=1)
-    return flatten_to_rgb(Image.open(pages[0]))
+def extract_intro_page(template_pptx: Path, tmpdir: Path, soffice_path: str) -> Image.Image:
+    pdf_path = convert_to_pdf(template_pptx, tmpdir / "template_pdf", soffice_path)
+    pages = pdf_to_images_poppler(pdf_path, tmpdir / "template_pages", 170)
+    if not pages:
+        raise RuntimeError("Template PowerPoint rendered no pages.")
+    return Image.open(pages[0]).convert("RGB").resize((PAGE_W, PAGE_H), Image.LANCZOS)
 
 
 def make_sheet_page(sheet_img_path: Path, sheet_name: str, logo_path: Path | None, show_sheet_name: bool) -> Image.Image:
     page = Image.new("RGB", (PAGE_W, PAGE_H), "white")
     draw = ImageDraw.Draw(page)
-
     sidebar_x = PAGE_W - SIDEBAR_W
     draw.rectangle((sidebar_x, 0, PAGE_W, PAGE_H), fill=SIDEBAR_BG)
     draw.line((sidebar_x, 20, sidebar_x, PAGE_H - 20), fill=DIVIDER, width=2)
@@ -328,64 +235,78 @@ def make_sheet_page(sheet_img_path: Path, sheet_name: str, logo_path: Path | Non
     if logo_path and logo_path.exists():
         logo = Image.open(logo_path).convert("RGBA")
         logo.thumbnail((120, 120), Image.LANCZOS)
-        logo_x = sidebar_x + (SIDEBAR_W - logo.width) // 2
-        page = paste_transparent(page, logo, (logo_x, 35))
-        draw = ImageDraw.Draw(page)
+        x = sidebar_x + (SIDEBAR_W - logo.width) // 2
+        page.paste(logo.convert("RGB"), (x, 35), logo)
 
     if show_sheet_name:
         font = load_font(18, bold=True)
-        text_area_w = SIDEBAR_W - 16
         label = "Nitty Gritty" if sheet_name == "NittyGrittySheet" else sheet_name
-        lines = fit_text_lines(draw, label, font, text_area_w)
         y = 180
-        for line in lines:
-            bbox = draw.textbbox((0, 0), line, font=font)
-            line_w = bbox[2] - bbox[0]
-            draw.text((sidebar_x + (SIDEBAR_W - line_w) / 2, y), line, fill=TITLE_COLOR, font=font)
+        for line in fit_text_lines(draw, label, font, SIDEBAR_W - 16):
+            box = draw.textbbox((0, 0), line, font=font)
+            draw.text((sidebar_x + (SIDEBAR_W - (box[2] - box[0])) / 2, y), line, fill=TITLE_COLOR, font=font)
             y += 28
 
-    shot = flatten_to_rgb(Image.open(sheet_img_path))
+    shot = Image.open(sheet_img_path).convert("RGB")
     scale = min(CONTENT_W / shot.width, CONTENT_H / shot.height)
-    new_size = (int(shot.width * scale), int(shot.height * scale))
-    shot = shot.resize(new_size, Image.LANCZOS)
+    shot = shot.resize((int(shot.width * scale), int(shot.height * scale)), Image.LANCZOS)
     left = MARGIN_X + (CONTENT_W - shot.width) // 2
     top = MARGIN_Y + (CONTENT_H - shot.height) // 2
     page.paste(shot, (left, top))
     return page
 
 
-def build_pdf(page_images: list[Image.Image], output_pdf: Path) -> Path:
-    """Save pages as a PDF after forcing every page into RGB mode.
-
-    This fixes Pillow's "image has wrong mode" error caused by transparent PNGs
-    or palette images being passed to the PDF writer.
-    """
-    if not page_images:
-        raise ValueError("No pages were generated for the PDF.")
-    rgb_pages = [flatten_to_rgb(img) for img in page_images]
-    first, rest = rgb_pages[0], rgb_pages[1:]
-    first.save(output_pdf, "PDF", resolution=180.0, save_all=True, append_images=rest)
+def build_pdf(pages: list[Image.Image], output_pdf: Path) -> Path:
+    rgb_pages = [p.convert("RGB") for p in pages]
+    rgb_pages[0].save(output_pdf, "PDF", resolution=180.0, save_all=True, append_images=rgb_pages[1:])
     return output_pdf
 
 
-def make_zip(file_path: Path, zip_path: Path) -> Path:
+def build_powerpoint(pages: list[Image.Image], output_pptx: Path, working_dir: Path) -> Path:
+    """Build a PowerPoint using the same full-page screenshot images as the PDF.
+
+    This keeps the worksheet screenshots exactly in the same wrapped format, but
+    gives the user a .pptx instead of a .pdf. Each page image becomes one slide.
+    """
+    prs = Presentation()
+    prs.slide_width = 12192000   # 13.333 inches
+    prs.slide_height = 6858000   # 7.5 inches
+    blank = prs.slide_layouts[6]
+
+    slide_image_dir = working_dir / "pptx_slide_images"
+    slide_image_dir.mkdir(parents=True, exist_ok=True)
+
+    for index, page in enumerate(pages, start=1):
+        img_path = slide_image_dir / f"slide_{index:02d}.jpg"
+        page.convert("RGB").save(img_path, quality=94, optimize=True)
+        slide = prs.slides.add_slide(blank)
+        slide.shapes.add_picture(str(img_path), 0, 0, width=prs.slide_width, height=prs.slide_height)
+
+    prs.save(output_pptx)
+    return output_pptx
+
+
+def make_zip(files: list[Path], zip_path: Path) -> Path:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.write(file_path, arcname=file_path.name)
+        for file_path in files:
+            archive.write(file_path, arcname=file_path.name)
     return zip_path
 
 
-def convert_excel_to_pdf(
+def convert_excel_to_export(
     uploaded_excel,
     selected_sheets: list[str],
+    all_sheet_names: list[str],
     uploaded_logo,
     uploaded_intro_pptx,
     title: str,
-    fit_each_sheet_to_one_page: bool,
+    output_format: str,
+    pure_direct_render: bool,
     crop_pages: bool,
     show_sheet_name: bool,
     dpi: int,
     margins: float,
-) -> tuple[bytes, bytes, str]:
+) -> tuple[bytes, bytes, bytes, str, str]:
     soffice_path = find_soffice()
     if not soffice_path:
         raise RuntimeError("LibreOffice was not found. Install LibreOffice locally or through packages.txt.")
@@ -398,7 +319,7 @@ def convert_excel_to_pdf(
         if uploaded_logo:
             raw_logo = save_upload(uploaded_logo, tmpdir / sanitize_filename(uploaded_logo.name))
             logo_path = tmpdir / "logo.png"
-            ellipse_transparent_logo(raw_logo, logo_path)
+            transparent_circle_logo(raw_logo, logo_path)
         elif DEFAULT_LOGO.exists():
             logo_path = DEFAULT_LOGO
 
@@ -406,65 +327,83 @@ def convert_excel_to_pdf(
         if uploaded_intro_pptx:
             intro_template = save_upload(uploaded_intro_pptx, tmpdir / sanitize_filename(uploaded_intro_pptx.name))
 
-        prepared_xlsx = tmpdir / "prepared.xlsx"
-        rendered_sheet_names = prepare_workbook_for_rendering(
-            excel_path,
-            prepared_xlsx,
-            selected_sheets,
-            fit_each_sheet_to_one_page,
-            margins,
-        )
+        # TRUE screenshot-style path: do not open or save the workbook with openpyxl.
+        # This avoids changing chart XML/cache before LibreOffice renders it.
+        if pure_direct_render and selected_sheets == all_sheet_names:
+            render_source = excel_path
+            rendered_names = all_sheet_names
+        else:
+            render_source = tmpdir / "prepared.xlsx"
+            rendered_names = prepare_workbook_for_rendering(excel_path, render_source, selected_sheets, margins)
 
-        pdf_path = convert_to_pdf(prepared_xlsx, tmpdir / "rendered_pdf", soffice_path)
-        page_images = pdf_to_images(pdf_path, tmpdir / "sheet_pages", dpi=dpi)
-        if len(page_images) < len(rendered_sheet_names):
-            raise RuntimeError(f"Expected {len(rendered_sheet_names)} pages, but rendered only {len(page_images)}.")
+        raw_pdf = convert_to_pdf(render_source, tmpdir / "raw_pdf", soffice_path)
+        raw_pdf_bytes = raw_pdf.read_bytes()
+        page_images = pdf_to_images_poppler(raw_pdf, tmpdir / "raw_pages", dpi)
+        if not page_images:
+            raise RuntimeError("LibreOffice produced a PDF, but no pages could be rendered.")
 
         screenshot_paths = []
-        for idx, img_path in enumerate(page_images[:len(rendered_sheet_names)], start=1):
+        for idx, img_path in enumerate(page_images, start=1):
             working = img_path
             if crop_pages:
-                cropped = tmpdir / "cropped" / f"sheet_{idx:02d}.png"
+                cropped = tmpdir / "cropped" / f"page_{idx:02d}.png"
                 cropped.parent.mkdir(exist_ok=True)
                 working = crop_white_space(working, cropped)
-            resized = tmpdir / "resized" / f"sheet_{idx:02d}.jpg"
+            resized = tmpdir / "resized" / f"page_{idx:02d}.jpg"
             resized.parent.mkdir(exist_ok=True)
             working = resize_for_page(working, resized)
             screenshot_paths.append(working)
 
         final_pages = []
         if intro_template:
-            intro = extract_intro_page(intro_template, tmpdir, soffice_path)
-            intro = flatten_to_rgb(intro.resize((PAGE_W, PAGE_H), Image.LANCZOS))
-            final_pages.append(intro)
+            final_pages.append(extract_intro_page(intro_template, tmpdir, soffice_path))
         else:
-            final_pages.append(create_generated_intro_page(title, logo_path))
+            final_pages.append(make_intro_page(title, logo_path))
 
-        for sheet_name, img_path in zip(rendered_sheet_names, screenshot_paths):
-            final_pages.append(make_sheet_page(img_path, sheet_name, logo_path, show_sheet_name))
+        # If LibreOffice emits more pages than sheet names, keep all pages and label extras as Page N.
+        for i, img_path in enumerate(screenshot_paths):
+            label = rendered_names[i] if i < len(rendered_names) else f"Page {i + 1}"
+            final_pages.append(make_sheet_page(img_path, label, logo_path, show_sheet_name))
 
         safe_title = sanitize_filename(title.replace(" ", "_"))
-        final_pdf = tmpdir / f"{safe_title}.pdf"
-        build_pdf(final_pages, final_pdf)
+
+        if output_format == "PowerPoint (.pptx)":
+            final_output = tmpdir / f"{safe_title}.pptx"
+            build_powerpoint(final_pages, final_output, tmpdir)
+            mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        else:
+            final_output = tmpdir / f"{safe_title}.pdf"
+            build_pdf(final_pages, final_output)
+            mime = "application/pdf"
 
         zip_path = tmpdir / f"{safe_title}.zip"
-        make_zip(final_pdf, zip_path)
-        return final_pdf.read_bytes(), zip_path.read_bytes(), final_pdf.name
+        make_zip([final_output, raw_pdf], zip_path)
+        return final_output.read_bytes(), zip_path.read_bytes(), raw_pdf_bytes, final_output.name, mime
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
-    st.title("📄 Excel Screenshot to PDF Builder")
-    st.caption("Upload an Excel workbook and export worksheet screenshots into a PDF. No chart rebuilding — charts stay in the Excel-rendered style.")
+    st.title("📄 Excel Direct Screenshot Export Builder")
+    st.caption("Direct-render the uploaded workbook through LibreOffice, then wrap those screenshots into either a PDF or PowerPoint. No chart rebuilding by default.")
 
     with st.sidebar:
         st.header("Settings")
         title = st.text_input("Output file name", value="Placement_Report_Screenshots")
-        fit_one_page = st.checkbox("Fit each worksheet to one landscape page", value=True)
+        output_format = st.radio(
+            "Output format",
+            options=["PDF", "PowerPoint (.pptx)"],
+            index=0,
+            help="PDF is best for sharing/printing. PowerPoint gives one full-page screenshot slide per page.",
+        )
+        pure_direct_render = st.checkbox(
+            "Pure screenshot mode: do not edit workbook before rendering",
+            value=True,
+            help="Best match for Excel chart formatting. If you select only some sheets, the app must prepare a copy and may alter chart internals.",
+        )
         crop_pages = st.checkbox("Crop extra white space around screenshots", value=True)
         show_sheet_name = st.checkbox("Show sheet name in the right sidebar", value=True)
         dpi = st.slider("Screenshot resolution", min_value=140, max_value=260, value=190, step=10)
-        margins = st.slider("Excel print margins", min_value=0.05, max_value=0.40, value=0.20, step=0.05)
+        margins = st.slider("Fallback mode Excel print margins", min_value=0.05, max_value=0.40, value=0.20, step=0.05)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -474,7 +413,7 @@ def main() -> None:
         intro_upload = st.file_uploader(
             "Optional PowerPoint template for intro page (.pptx)",
             type=["pptx"],
-            help="If you upload an older deck, the app will reuse page 1 as the intro page.",
+            help="If uploaded, the app reuses the first slide as the PDF intro page.",
         )
 
     if not excel_upload:
@@ -489,29 +428,35 @@ def main() -> None:
 
     st.subheader("Sheets to include")
     selected_sheets = st.multiselect("Choose sheets and order them", options=sheet_names, default=sheet_names)
+    if pure_direct_render and selected_sheets != sheet_names:
+        st.warning("Pure screenshot mode can only render the workbook as-is. Because you selected a subset/order, the app will use fallback mode and prepare a copy of the workbook.")
     st.write(f"Selected **{len(selected_sheets)}** sheet(s).")
 
-    if st.button("Generate PDF", type="primary", disabled=not selected_sheets):
+    if st.button(f"Generate {output_format}", type="primary", disabled=not selected_sheets):
         try:
-            with st.spinner("Rendering workbook screenshots and building PDF..."):
-                pdf_bytes, zip_bytes, pdf_name = convert_excel_to_pdf(
+            with st.spinner(f"Rendering workbook and building {output_format}..."):
+                output_bytes, zip_bytes, raw_pdf_bytes, output_name, output_mime = convert_excel_to_export(
                     uploaded_excel=excel_upload,
                     selected_sheets=selected_sheets,
+                    all_sheet_names=sheet_names,
                     uploaded_logo=logo_upload,
                     uploaded_intro_pptx=intro_upload,
                     title=title,
-                    fit_each_sheet_to_one_page=fit_one_page,
+                    output_format=output_format,
+                    pure_direct_render=pure_direct_render,
                     crop_pages=crop_pages,
                     show_sheet_name=show_sheet_name,
                     dpi=dpi,
                     margins=margins,
                 )
-            st.success("PDF created successfully.")
-            st.download_button("Download PDF", data=pdf_bytes, file_name=pdf_name, mime="application/pdf")
-            st.download_button("Download ZIP", data=zip_bytes, file_name=pdf_name.replace(".pdf", ".zip"), mime="application/zip")
+            st.success(f"{output_format} created successfully.")
+            st.download_button(f"Download final {output_format}", data=output_bytes, file_name=output_name, mime=output_mime)
+            st.download_button("Download ZIP", data=zip_bytes, file_name=output_name.rsplit('.', 1)[0] + ".zip", mime="application/zip")
+            st.download_button("Download raw LibreOffice PDF for comparison", data=raw_pdf_bytes, file_name="raw_libreoffice_render.pdf", mime="application/pdf")
+            st.caption("If the raw LibreOffice PDF does not match Microsoft Excel, the mismatch is coming from LibreOffice chart rendering, not from the PDF/PowerPoint wrapper.")
         except Exception as exc:
             st.error(str(exc))
-            st.caption("If this is a dependency error, make sure packages.txt includes both libreoffice and poppler-utils. If it mentions image mode, update to this RGB-fixed version of the app.")
+            st.caption("Make sure packages.txt contains both libreoffice and poppler-utils on Streamlit Cloud.")
 
 
 if __name__ == "__main__":
