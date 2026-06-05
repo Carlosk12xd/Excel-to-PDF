@@ -807,6 +807,20 @@ def date_label(d: date) -> str:
     return f"{d.month}/{d.day}/{d.year}"
 
 
+# Render DPI for the rebuilt weekly charts. The figure is sized so that
+# (figure_inches * RENDER_DPI) equals the destination box in pixels exactly, so
+# the chart is never stretched or squished when pasted back onto the worksheet.
+CHART_RENDER_DPI = 160
+# Pixel height of the BYU Marriott weekly-chart box that the original good-looking
+# deck was tuned against. Font sizes scale relative to this so a smaller box gets
+# proportionally smaller text instead of oversized labels.
+CHART_REFERENCE_HEIGHT_PX = 450
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
 def render_rebuilt_line_chart(
     output_path: Path,
     dates: list[date],
@@ -818,25 +832,43 @@ def render_rebuilt_line_chart(
     height_px: int,
     max_axis_labels: int = 10,
 ) -> Path:
-    """Draw an Excel-style weekly line chart.
+    """Draw an Excel-style weekly line chart at an exact pixel size.
 
-    The rebuilt charts intentionally use smaller Excel-like typography and fixed
-    figure dimensions. That keeps labels/legends from growing, shifting, or
-    covering the chart when the image is pasted back over the worksheet.
+    Robustness rules that fix the off-center / oversized-text / clipped-legend /
+    broken-chart problems:
+
+    1. The figure is rendered at EXACTLY ``width_px`` x ``height_px`` pixels, so
+       ``paste_chart`` never has to resize (and therefore never distorts) it.
+    2. Font sizes scale with the box height, so the typography looks the same on
+       a large or a small render instead of ballooning on small boxes.
+    3. ``layout="constrained"`` plus an *outside* bottom legend lets Matplotlib
+       reserve room for the rotated date labels and the legend automatically.
+       This holds even when the server lacks Calibri and falls back to the wider
+       DejaVu Sans font, which is what used to push text over the legend.
     """
-    dpi = 160
-    fig_w = max(width_px / dpi, 3.0)
-    fig_h = max(height_px / dpi, 1.8)
+    width_px = max(1, int(width_px))
+    height_px = max(1, int(height_px))
+
+    fig_w = width_px / CHART_RENDER_DPI
+    fig_h = height_px / CHART_RENDER_DPI
+
+    # Scale typography to the destination box. s == 1.0 reproduces the original
+    # good-looking deck; smaller boxes shrink the text proportionally.
+    s = _clamp(height_px / CHART_REFERENCE_HEIGHT_PX, 0.6, 1.5)
+    title_fs = 10.2 * s
+    ylabel_fs = 7.2 * s
+    ytick_fs = 6.7 * s
+    legend_fs = 6.3 * s
 
     # Excel/PowerPoint-like font fallback. Calibri may not exist on Streamlit
     # Cloud, so Arial/DejaVu Sans are safe fallbacks.
     plt.rcParams.update({
-        "font.family": ["Calibri", "Arial", "DejaVu Sans", "sans-serif"],
+        "font.family": ["Calibri", "Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
         "axes.edgecolor": "#D9D9D9",
         "axes.linewidth": 0.8,
     })
 
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=CHART_RENDER_DPI, layout="constrained")
 
     x = list(range(len(dates)))
     excel_colors = ["#156082", "#E97132", "#0F9ED5", "#70AD47", "#A5A5A5", "#7030A0"]
@@ -856,36 +888,33 @@ def render_rebuilt_line_chart(
     tick_indices = make_tick_indices(len(dates), max_ticks=max_axis_labels)
     ax.set_xticks(tick_indices)
 
-    # Keep the original-style m/d/yyyy labels, but center every label on an
-    # actual weekly data point. This fixes the newest date looking shifted left
-    # or right compared with the other labels.
-    x_label_font = 6.0 if len(tick_indices) <= 18 else 5.5
+    # Date labels sit on real weekly data points and always include the first and
+    # newest workbook dates. ha="right" anchors each rotated label's end at its
+    # tick so the newest label can never overflow the right edge of the chart.
+    xtick_fs = (6.0 if len(tick_indices) <= 18 else 5.5) * s
     ax.set_xticklabels(
         [date_label(dates[i]) for i in tick_indices],
         rotation=45,
-        rotation_mode="default",
-        ha="center",
+        rotation_mode="anchor",
+        ha="right",
         va="top",
-        fontsize=x_label_font,
+        fontsize=xtick_fs,
         color="#595959",
     )
     if dates:
-        # Add a small category margin so the first and latest labels can remain
-        # centered under their ticks without clipping or appearing off-center.
+        # Small category margin so the first/last markers are not clipped.
         ax.set_xlim(-0.7, len(dates) - 0.3)
-    for tick_label in ax.get_xticklabels():
-        tick_label.set_clip_on(False)
 
     # Match the compact Excel chart look instead of large Matplotlib defaults.
-    ax.set_title(title, fontsize=10.2, color="#595959", pad=6, loc="left", fontweight="normal")
-    ax.set_ylabel(y_label, fontsize=7.2, color="#595959")
+    ax.set_title(title, fontsize=title_fs, color="#595959", pad=6, loc="left", fontweight="normal")
+    ax.set_ylabel(y_label, fontsize=ylabel_fs, color="#595959")
     ax.grid(axis="y", color="#D9D9D9", linewidth=0.7)
     ax.grid(axis="x", visible=False)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.spines["left"].set_color("#D9D9D9")
     ax.spines["bottom"].set_color("#D9D9D9")
-    ax.tick_params(axis="y", labelsize=6.7, colors="#595959", length=0)
+    ax.tick_params(axis="y", labelsize=ytick_fs, colors="#595959", length=0)
     ax.tick_params(axis="x", colors="#595959", length=0, pad=2)
 
     if percent_axis:
@@ -904,39 +933,49 @@ def render_rebuilt_line_chart(
             top = max(all_values) * 1.18
             ax.set_ylim(0, top if top > 0 else 1)
 
-    # Put the legend in the bottom margin, not over the lines or date labels.
+    # Put the legend OUTSIDE the axes at the bottom. With constrained layout this
+    # reserves its own space, so it can never cover the lines or the date labels.
     if len(series) > 1:
-        ax.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.27),
+        fig.legend(
+            loc="outside lower center",
             ncol=min(3, len(series)),
-            fontsize=6.3,
+            fontsize=legend_fs,
             frameon=False,
             handlelength=1.6,
             handletextpad=0.35,
-            columnspacing=0.8,
-            borderaxespad=0.0,
+            columnspacing=0.9,
         )
-        fig.subplots_adjust(left=0.09, right=0.985, top=0.84, bottom=0.34)
-    else:
-        fig.subplots_adjust(left=0.09, right=0.985, top=0.84, bottom=0.26)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    # Do NOT use bbox_inches="tight" here. Tight bounding boxes change the final
-    # image dimensions and can make labels/legends scale unexpectedly when pasted
-    # back into the worksheet screenshot.
-    fig.savefig(output_path, facecolor="white", dpi=dpi)
+    # Render at exactly width_px x height_px. No bbox_inches="tight" (which would
+    # change the output size); constrained layout already guarantees nothing is
+    # clipped while keeping the requested pixel dimensions.
+    fig.savefig(output_path, facecolor="white", dpi=CHART_RENDER_DPI)
     plt.close(fig)
     return output_path
 
+
 def paste_chart(image: Image.Image, chart_path: Path, box: tuple[int, int, int, int]) -> None:
+    """Cover the stale Excel chart with a clean white panel and paste the rebuilt
+    chart at its native size (no resizing, so no distortion)."""
     left, top, right, bottom = box
-    width = max(1, right - left)
-    height = max(1, bottom - top)
-    chart = Image.open(chart_path).convert("RGB").resize((width, height), Image.LANCZOS)
+    box_w = max(1, right - left)
+    box_h = max(1, bottom - top)
+
     draw = ImageDraw.Draw(image)
     draw.rectangle(box, fill="white", outline=(225, 225, 225), width=1)
-    image.paste(chart, (left, top))
+
+    chart = Image.open(chart_path).convert("RGB")
+    # The chart is rendered at the box size, but guard against any off-by-one so
+    # it always fits inside the white panel without being stretched.
+    if chart.size != (box_w, box_h):
+        scale = min(box_w / chart.width, box_h / chart.height)
+        new_size = (max(1, int(chart.width * scale)), max(1, int(chart.height * scale)))
+        chart = chart.resize(new_size, Image.LANCZOS)
+
+    paste_x = left + (box_w - chart.width) // 2
+    paste_y = top + (box_h - chart.height) // 2
+    image.paste(chart, (paste_x, paste_y))
 
 
 def rebuild_weekly_charts_on_sheet_image(
@@ -955,11 +994,19 @@ def rebuild_weekly_charts_on_sheet_image(
     NittyGrittySheet and pastes newly rendered chart images over the two top
     weekly charts, guaranteeing the original starting date and newest workbook date both appear on the x-axis.
     """
+    def _keep_original() -> Path:
+        """Return the untouched screenshot when this sheet is not a weekly
+        dashboard, so non-NittyGritty sheets render exactly as Excel drew them."""
+        if image_path == output_path:
+            return image_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.open(image_path).convert("RGB").save(output_path)
+        return output_path
+
     wb = load_workbook(prepared_workbook_path, data_only=True)
     rows = find_weekly_block_rows(wb, sheet_name)
     if rows is None:
-        image_path.replace(output_path) if image_path != output_path else None
-        return output_path if output_path.exists() else image_path
+        return _keep_original()
 
     date_row, placement_value_row, status_date_row, status_rows = rows
     ws = wb["NittyGrittySheet"]
@@ -967,8 +1014,7 @@ def rebuild_weekly_charts_on_sheet_image(
     placement_dates, placement_values = extract_horizontal_weekly_series(ws, date_row, placement_value_row)
     placement_dates, placement_values = full_weekly_series(placement_dates, placement_values)
     if len(placement_dates) < 2:
-        image_path.replace(output_path) if image_path != output_path else None
-        return output_path if output_path.exists() else image_path
+        return _keep_original()
 
     status_maps: dict[str, dict[date, float]] = {}
     status_date_lists: list[list[date]] = []
