@@ -580,10 +580,19 @@ def build_powerpoint(
                 Inches(sidebar_width_inches - 0.08),
                 Inches(4.8),
             )
-            p = box.text_frame.paragraphs[0]
-            p.text = "Nitty Gritty" if sheet_name == "NittyGrittySheet" else sheet_name
+            tf = box.text_frame
+            # Wrap long names (e.g. "MSB Full-Time Dashboard") inside the narrow
+            # sidebar instead of letting them overflow past the slide edge.
+            tf.word_wrap = True
+            label = "Nitty Gritty" if sheet_name == "NittyGrittySheet" else sheet_name
+            p = tf.paragraphs[0]
+            p.text = label
             p.alignment = PP_ALIGN.CENTER
-            p.font.size = Pt(10)
+            # Shrink the font a little for long labels so they wrap cleanly to a
+            # couple of lines rather than crowding the sidebar.
+            longest_word = max((len(w) for w in label.split()), default=len(label))
+            label_font = 10 if (len(label) <= 14 and longest_word <= 12) else 8
+            p.font.size = Pt(label_font)
             p.font.bold = True
             p.font.color.rgb = BYU_NAVY
 
