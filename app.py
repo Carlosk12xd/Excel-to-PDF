@@ -1,45 +1,34 @@
 import io
-import os
-import re
 import shutil
 import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
-from datetime import date, datetime
-from numbers import Number
-import math
-import logging
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
-from matplotlib.ticker import FuncFormatter
 
 import fitz  # PyMuPDF
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.datetime import from_excel
 from openpyxl.worksheet.page import PageMargins
-from PIL import Image, ImageChops, ImageDraw
-from pptx import Presentation
-from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
-from pptx.util import Inches, Pt
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
-
-APP_TITLE = "Excel to PowerPoint Dashboard Builder"
+APP_TITLE = "Excel Screenshot to PDF Builder"
 DEFAULT_LOGO = Path("assets/default_logo.png")
 
-BYU_NAVY = RGBColor(16, 49, 101)
-SIDEBAR_BG = RGBColor(245, 246, 248)
-SIDEBAR_DIVIDER = RGBColor(205, 208, 214)
+PAGE_W = 1920
+PAGE_H = 1080
+SIDEBAR_W = 170
+MARGIN_X = 20
+MARGIN_Y = 20
+CONTENT_W = PAGE_W - SIDEBAR_W - 2 * MARGIN_X - 10
+CONTENT_H = PAGE_H - 2 * MARGIN_Y
+SIDEBAR_BG = (245, 246, 248)
+DIVIDER = (205, 208, 214)
+TITLE_COLOR = (16, 49, 101)
+TEXT_COLOR = (45, 45, 45)
 
 
 def find_soffice() -> str | None:
-    """Find the LibreOffice executable."""
     candidates = [
         shutil.which("soffice"),
         shutil.which("libreoffice"),
@@ -64,229 +53,19 @@ def sanitize_filename(name: str) -> str:
     return "".join(ch if ch in allowed else "_" for ch in name).strip() or "file"
 
 
-CELL_RANGE_RE = re.compile(
-    r"(?P<sheet>'(?:[^']|'')+'|[^!]+)!"
-    r"\$?(?P<start_col>[A-Z]{1,3})\$?(?P<start_row>\d+)"
-    r"(?::\$?(?P<end_col>[A-Z]{1,3})\$?(?P<end_row>\d+))?"
-)
-
-
-def parse_excel_date(value) -> date | None:
-    """Return a Python date when a cell contains an Excel date or date-looking text."""
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-
-    # Some workbooks store dates as Excel serial numbers. Keep the bounds
-    # conservative so normal dashboard counts are not accidentally treated as dates.
-    if isinstance(value, Number) and 25000 <= float(value) <= 90000:
+def get_sheet_names_from_upload(uploaded_excel) -> list[str]:
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp.write(uploaded_excel.getbuffer())
+        tmp_path = Path(tmp.name)
+    try:
+        wb = load_workbook(tmp_path, read_only=True)
+        return wb.sheetnames
+    finally:
         try:
-            converted = from_excel(value)
-            return converted.date() if isinstance(converted, datetime) else converted
-        except Exception:
+            tmp_path.unlink()
+        except OSError:
             pass
 
-    if isinstance(value, str):
-        text = value.strip()
-        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%m-%d-%Y", "%Y/%m/%d"):
-            try:
-                return datetime.strptime(text, fmt).date()
-            except ValueError:
-                pass
-    return None
-
-def unquote_sheet_name(name: str) -> str:
-    if name.startswith("'") and name.endswith("'"):
-        return name[1:-1].replace("''", "'")
-    return name
-
-
-def quote_sheet_name(name: str) -> str:
-    return "'" + name.replace("'", "''") + "'" if any(ch in name for ch in " !'()") else name
-
-
-def get_horizontal_range_parts(formula: str):
-    """Parse formulas like NittyGrittySheet!$B$23:$AE$23.
-
-    Returns None unless the reference is a single horizontal row range.
-    """
-    if not formula:
-        return None
-    match = CELL_RANGE_RE.search(formula)
-    if not match:
-        return None
-
-    start_row = int(match.group("start_row"))
-    end_row = int(match.group("end_row") or match.group("start_row"))
-    if start_row != end_row:
-        return None
-
-    from openpyxl.utils import column_index_from_string
-
-    sheet_name = unquote_sheet_name(match.group("sheet"))
-    start_col = column_index_from_string(match.group("start_col"))
-    end_col = column_index_from_string(match.group("end_col") or match.group("start_col"))
-    return sheet_name, start_row, start_col, end_col
-
-
-def make_horizontal_range_formula(sheet_name: str, row: int, start_col: int, end_col: int) -> str:
-    from openpyxl.utils import get_column_letter
-
-    quoted = quote_sheet_name(sheet_name)
-    return f"{quoted}!${get_column_letter(start_col)}${row}:${get_column_letter(end_col)}${row}"
-
-
-def clear_chart_reference_cache(ref_obj) -> None:
-    """Force Excel/LibreOffice to rebuild chart caches from the updated source range."""
-    if not ref_obj:
-        return
-    for attr in ("numCache", "strCache", "multiLvlStrCache"):
-        if hasattr(ref_obj, attr):
-            try:
-                setattr(ref_obj, attr, None)
-            except Exception:
-                pass
-
-
-def latest_date_col_for_row(
-    ws,
-    row: int,
-    start_col: int,
-    end_col_hint: int | None = None,
-    cap_at_today: bool = False,
-) -> tuple[int | None, date | None]:
-    """Find the newest date column in a horizontal date row.
-
-    By default this uses the latest date that exists in the uploaded workbook,
-    even if that date is later than the date when the app code was written. This
-    is what makes the app work for future weekly updates like 5/22, 5/29, 6/5,
-    and so on.
-
-    If cap_at_today=True, it ignores dates after the server's current date. Use
-    that only when the workbook has blank placeholder columns for future weeks.
-    """
-    max_col = max(ws.max_column, end_col_hint or 0)
-    dated_cols: list[tuple[date, int]] = []
-
-    for col in range(start_col, max_col + 1):
-        cell_date = parse_excel_date(ws.cell(row=row, column=col).value)
-        if not cell_date:
-            continue
-        if cap_at_today and cell_date > date.today():
-            continue
-        dated_cols.append((cell_date, col))
-
-    if not dated_cols:
-        return None, None
-
-    latest_date, latest_col = max(dated_cols, key=lambda item: item[0])
-    return latest_col, latest_date
-
-def latest_used_col_for_row(ws, row: int, start_col: int, end_col_hint: int | None = None) -> int | None:
-    max_col = max(ws.max_column, end_col_hint or 0)
-    latest = None
-    for col in range(start_col, max_col + 1):
-        value = ws.cell(row=row, column=col).value
-        if value not in (None, ""):
-            latest = col
-    return latest
-
-
-def update_ref_formula_to_end_col(ref_obj, target_end_col: int | None) -> bool:
-    if not ref_obj or not getattr(ref_obj, "f", None) or not target_end_col:
-        return False
-
-    parts = get_horizontal_range_parts(ref_obj.f)
-    if not parts:
-        return False
-
-    sheet_name, row, start_col, current_end_col = parts
-    if target_end_col <= current_end_col:
-        # Still clear stale caches, because cached chart data can make LibreOffice
-        # render old points even when the workbook data is newer.
-        clear_chart_reference_cache(ref_obj)
-        return False
-
-    ref_obj.f = make_horizontal_range_formula(sheet_name, row, start_col, target_end_col)
-    clear_chart_reference_cache(ref_obj)
-    return True
-
-
-def extend_charts_to_latest_available_date(wb, cap_at_today: bool = False) -> tuple[int, date | None]:
-    """Extend horizontal chart ranges to the newest date in the uploaded workbook.
-
-    This fixes the exact problem where the Excel file contains a newer weekly
-    pull date, but the saved chart range still ends at an older date. The app now
-    scans the chart's category/date row and extends the category and value ranges
-    to the newest date it finds. Nothing is hardcoded to 5/15, 5/22, or any other
-    specific date.
-    """
-    updates = 0
-    newest_date_seen: date | None = None
-
-    # Ask Excel/LibreOffice to rebuild formulas and chart caches during render.
-    try:
-        wb.calculation.calcMode = "auto"
-        wb.calculation.fullCalcOnLoad = True
-        wb.calculation.forceFullCalc = True
-    except Exception:
-        pass
-
-    for chart_ws in wb.worksheets:
-        for chart in getattr(chart_ws, "_charts", []):
-            for series in getattr(chart, "series", []):
-                target_end_col = None
-
-                # Prefer the category/date row because it controls the weekly x-axis.
-                cat = getattr(series, "cat", None)
-                cat_refs = []
-                if cat is not None:
-                    cat_refs.extend([getattr(cat, "strRef", None), getattr(cat, "numRef", None)])
-
-                for cat_ref in cat_refs:
-                    if not cat_ref or not getattr(cat_ref, "f", None):
-                        continue
-                    parts = get_horizontal_range_parts(cat_ref.f)
-                    if not parts:
-                        continue
-                    sheet_name, row, start_col, end_col = parts
-                    if sheet_name not in wb.sheetnames:
-                        continue
-                    target_end_col, latest_seen = latest_date_col_for_row(
-                        wb[sheet_name],
-                        row,
-                        start_col,
-                        end_col_hint=end_col,
-                        cap_at_today=cap_at_today,
-                    )
-                    if latest_seen and (newest_date_seen is None or latest_seen > newest_date_seen):
-                        newest_date_seen = latest_seen
-                    if target_end_col:
-                        updates += int(update_ref_formula_to_end_col(cat_ref, target_end_col))
-                        break
-
-                # Extend each value series to the same final column as its date row.
-                val = getattr(series, "val", None)
-                val_ref = getattr(val, "numRef", None) if val is not None else None
-                if val_ref and getattr(val_ref, "f", None):
-                    if not target_end_col:
-                        parts = get_horizontal_range_parts(val_ref.f)
-                        if parts:
-                            sheet_name, row, start_col, end_col = parts
-                            if sheet_name in wb.sheetnames:
-                                target_end_col = latest_used_col_for_row(
-                                    wb[sheet_name], row, start_col, end_col_hint=end_col
-                                )
-                    updates += int(update_ref_formula_to_end_col(val_ref, target_end_col))
-
-                # Clear title caches too, just in case LibreOffice uses stale chart XML.
-                tx = getattr(series, "tx", None)
-                tx_ref = getattr(tx, "strRef", None) if tx is not None else None
-                clear_chart_reference_cache(tx_ref)
-
-    normalize_weekly_chart_axes(wb)
-    return updates, newest_date_seen
 
 def prepare_workbook_for_rendering(
     source_xlsx: Path,
@@ -294,13 +73,10 @@ def prepare_workbook_for_rendering(
     include_sheets: list[str],
     fit_each_sheet_to_one_page: bool,
     margins: float,
-    auto_extend_latest_date: bool,
-    cap_chart_dates_at_today: bool,
 ) -> list[str]:
-    """Copy workbook, hide excluded sheets, and set print layout."""
     wb = load_workbook(source_xlsx)
-
     visible_sheets = []
+
     for ws in wb.worksheets:
         if ws.title in include_sheets:
             ws.sheet_state = "visible"
@@ -309,9 +85,8 @@ def prepare_workbook_for_rendering(
             ws.sheet_state = "hidden"
 
     if not visible_sheets:
-        raise ValueError("No sheets selected. Select at least one sheet.")
+        raise ValueError("No sheets selected.")
 
-    # Excel requires at least one visible sheet; this is guaranteed above.
     for ws in wb.worksheets:
         if ws.title not in visible_sheets:
             continue
@@ -344,15 +119,11 @@ def prepare_workbook_for_rendering(
             ws.page_setup.fitToHeight = 1
             ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-    if auto_extend_latest_date:
-        extend_charts_to_latest_available_date(wb, cap_at_today=cap_chart_dates_at_today)
-
     wb.save(output_xlsx)
     return visible_sheets
 
 
 def convert_to_pdf(input_file: Path, output_dir: Path, soffice_path: str) -> Path:
-    """Convert a spreadsheet or PowerPoint to PDF using LibreOffice."""
     output_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         soffice_path,
@@ -363,7 +134,7 @@ def convert_to_pdf(input_file: Path, output_dir: Path, soffice_path: str) -> Pat
         str(output_dir),
         str(input_file),
     ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=240)
     if result.returncode != 0:
         raise RuntimeError(
             "LibreOffice failed to convert the file to PDF.\n\n"
@@ -380,13 +151,10 @@ def convert_to_pdf(input_file: Path, output_dir: Path, soffice_path: str) -> Pat
 
 
 def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int) -> list[Path]:
-    """Render every PDF page to a PNG image."""
     output_dir.mkdir(parents=True, exist_ok=True)
     doc = fitz.open(str(pdf_path))
     image_paths = []
-    zoom = dpi / 72
-    matrix = fitz.Matrix(zoom, zoom)
-
+    matrix = fitz.Matrix(dpi / 72, dpi / 72)
     for page_index in range(len(doc)):
         page = doc[page_index]
         pix = page.get_pixmap(matrix=matrix, alpha=False)
@@ -398,13 +166,11 @@ def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int) -> list[Path]:
 
 
 def crop_white_space(image_path: Path, output_path: Path, threshold: int = 12, margin_px: int = 18) -> Path:
-    """Crop white margins around an image while keeping a small border."""
     image = Image.open(image_path).convert("RGB")
     white = Image.new("RGB", image.size, (255, 255, 255))
     diff = ImageChops.difference(image, white)
     mask = diff.point(lambda p: 255 if p > threshold else 0)
     bbox = mask.getbbox()
-
     if bbox is None:
         image.save(output_path)
         return output_path
@@ -413,201 +179,123 @@ def crop_white_space(image_path: Path, output_path: Path, threshold: int = 12, m
     top = max(0, bbox[1] - margin_px)
     right = min(image.width, bbox[2] + margin_px)
     bottom = min(image.height, bbox[3] + margin_px)
-    cropped = image.crop((left, top, right, bottom))
-    cropped.save(output_path)
+    image.crop((left, top, right, bottom)).save(output_path)
     return output_path
 
 
-def resize_for_ppt(image_path: Path, output_path: Path, max_dimension: int = 2200) -> Path:
-    """Downsize very large screenshots so the PPTX stays reasonably small."""
+def resize_for_page(image_path: Path, output_path: Path, max_dimension: int = 2600) -> Path:
     image = Image.open(image_path).convert("RGB")
     scale = min(max_dimension / image.width, max_dimension / image.height, 1.0)
     if scale < 1.0:
-        new_size = (int(image.width * scale), int(image.height * scale))
-        image = image.resize(new_size, Image.LANCZOS)
-    image.save(output_path, quality=92, optimize=True)
+        image = image.resize((int(image.width * scale), int(image.height * scale)), Image.LANCZOS)
+    image.save(output_path, quality=94, optimize=True)
     return output_path
 
 
-def make_circular_logo_transparent(source: Path, output: Path) -> Path:
-    """Make the area outside the main dark circular logo transparent.
-
-    This works well for the BYU Marriott circular logo. It keeps the white letters
-    inside the circle because it uses an ellipse mask instead of removing all white pixels.
-    """
+def ellipse_transparent_logo(source: Path, output: Path) -> Path:
     image = Image.open(source).convert("RGBA")
-    rgb = image.convert("RGB")
-    pixels = rgb.load()
-
-    dark_points = []
-    step = max(1, min(image.size) // 500)
-    for y in range(0, image.height, step):
-        for x in range(0, image.width, step):
-            r, g, b = pixels[x, y]
-            if b > r + 15 and b > g + 5 and (r + g + b) < 450:
-                dark_points.append((x, y))
-
-    if not dark_points:
-        image.save(output)
-        return output
-
-    xs = [p[0] for p in dark_points]
-    ys = [p[1] for p in dark_points]
-    bbox = (min(xs), min(ys), max(xs), max(ys))
-    pad = int(min(image.size) * 0.02)
-    bbox = (
-        max(0, bbox[0] - pad),
-        max(0, bbox[1] - pad),
-        min(image.width - 1, bbox[2] + pad),
-        min(image.height - 1, bbox[3] + pad),
-    )
-
     mask = Image.new("L", image.size, 0)
     draw = ImageDraw.Draw(mask)
-    draw.ellipse(bbox, fill=255)
+    pad = int(min(image.size) * 0.01)
+    draw.ellipse((pad, pad, image.width - pad, image.height - pad), fill=255)
     image.putalpha(mask)
     image.save(output)
     return output
 
 
-def add_generated_intro_slide(prs: Presentation, title: str, subtitle: str, logo_path: Path | None) -> None:
-    blank = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(blank)
+def load_font(size: int, bold: bool = False):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
 
-    bar = slide.shapes.add_shape(1, 0, 0, prs.slide_width, Inches(0.75))
-    bar.fill.solid()
-    bar.fill.fore_color.rgb = BYU_NAVY
-    bar.line.fill.background()
 
-    title_box = slide.shapes.add_textbox(Inches(0.85), Inches(1.65), Inches(8.2), Inches(1.0))
-    tf = title_box.text_frame
-    p = tf.paragraphs[0]
-    p.text = title
-    p.font.size = Pt(34)
-    p.font.bold = True
-    p.font.color.rgb = BYU_NAVY
+def fit_text_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return [""]
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        test = f"{current} {word}"
+        width = draw.textbbox((0, 0), test, font=font)[2]
+        if width <= max_width:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
 
-    subtitle_box = slide.shapes.add_textbox(Inches(0.85), Inches(2.65), Inches(7.8), Inches(1.0))
-    p2 = subtitle_box.text_frame.paragraphs[0]
-    p2.text = subtitle
-    p2.font.size = Pt(18)
-    p2.font.color.rgb = RGBColor(45, 45, 45)
+
+def create_generated_intro_page(title: str, logo_path: Path | None) -> Image.Image:
+    page = Image.new("RGB", (PAGE_W, PAGE_H), "white")
+    draw = ImageDraw.Draw(page)
+    draw.rectangle((0, 0, PAGE_W, 95), fill=(16, 49, 101))
+    title_font = load_font(54, bold=True)
+    subtitle_font = load_font(28, bold=False)
+    draw.text((120, 210), title, fill=TITLE_COLOR, font=title_font)
+    draw.text((120, 300), "Generated from the uploaded Excel workbook.", fill=TEXT_COLOR, font=subtitle_font)
+    if logo_path and logo_path.exists():
+        logo = Image.open(logo_path).convert("RGBA")
+        logo.thumbnail((300, 300), Image.LANCZOS)
+        page.alpha_composite(logo, (1450, 150))
+    return page.convert("RGB")
+
+
+def extract_intro_page(template_pptx: Path, working_dir: Path, soffice_path: str) -> Image.Image:
+    pdf_path = convert_to_pdf(template_pptx, working_dir / "template_pdf", soffice_path)
+    pages = pdf_to_images(pdf_path, working_dir / "template_pages", dpi=170)
+    if not pages:
+        raise RuntimeError("Could not render the template PowerPoint.")
+    return Image.open(pages[0]).convert("RGB")
+
+
+def make_sheet_page(sheet_img_path: Path, sheet_name: str, logo_path: Path | None, show_sheet_name: bool) -> Image.Image:
+    page = Image.new("RGB", (PAGE_W, PAGE_H), "white")
+    draw = ImageDraw.Draw(page)
+    # sidebar
+    sidebar_x = PAGE_W - SIDEBAR_W
+    draw.rectangle((sidebar_x, 0, PAGE_W, PAGE_H), fill=SIDEBAR_BG)
+    draw.line((sidebar_x, 20, sidebar_x, PAGE_H - 20), fill=DIVIDER, width=2)
 
     if logo_path and logo_path.exists():
-        slide.shapes.add_picture(str(logo_path), Inches(9.75), Inches(1.25), width=Inches(2.25), height=Inches(2.25))
+        logo = Image.open(logo_path).convert("RGBA")
+        logo.thumbnail((120, 120), Image.LANCZOS)
+        logo_x = sidebar_x + (SIDEBAR_W - logo.width) // 2
+        page.alpha_composite(logo, (logo_x, 35))
+
+    if show_sheet_name:
+        font = load_font(18, bold=True)
+        text_area_w = SIDEBAR_W - 16
+        lines = fit_text_lines(draw, "Nitty Gritty" if sheet_name == "NittyGrittySheet" else sheet_name, font, text_area_w)
+        y = 180
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_w = bbox[2] - bbox[0]
+            draw.text((sidebar_x + (SIDEBAR_W - line_w) / 2, y), line, fill=TITLE_COLOR, font=font)
+            y += 28
+
+    shot = Image.open(sheet_img_path).convert("RGB")
+    scale = min(CONTENT_W / shot.width, CONTENT_H / shot.height)
+    new_size = (int(shot.width * scale), int(shot.height * scale))
+    shot = shot.resize(new_size, Image.LANCZOS)
+    left = MARGIN_X + (CONTENT_W - shot.width) // 2
+    top = MARGIN_Y + (CONTENT_H - shot.height) // 2
+    page.paste(shot, (left, top))
+    return page
 
 
-def add_intro_from_template(prs: Presentation, template_pptx: Path, working_dir: Path, soffice_path: str) -> None:
-    """Use the first slide from a template deck as a full-slide screenshot."""
-    pdf_dir = working_dir / "template_pdf"
-    pdf_path = convert_to_pdf(template_pptx, pdf_dir, soffice_path)
-    page_images = pdf_to_images(pdf_path, working_dir / "template_pages", dpi=160)
-    if not page_images:
-        raise RuntimeError("Template PowerPoint did not render any slides.")
-
-    first_slide_img = page_images[0]
-    blank = prs.slide_layouts[6]
-    slide = prs.slides.add_slide(blank)
-    slide.shapes.add_picture(str(first_slide_img), 0, 0, width=prs.slide_width, height=prs.slide_height)
-
-
-def build_powerpoint(
-    sheet_image_paths: list[Path],
-    sheet_names: list[str],
-    output_pptx: Path,
-    logo_path: Path | None,
-    intro_template_pptx: Path | None,
-    working_dir: Path,
-    soffice_path: str,
-    show_sheet_name: bool,
-    sidebar_width_inches: float,
-    title: str,
-) -> Path:
-    prs = Presentation()
-    prs.slide_width = 12192000  # 13.333 in
-    prs.slide_height = 6858000  # 7.5 in
-    blank = prs.slide_layouts[6]
-
-    if intro_template_pptx:
-        add_intro_from_template(prs, intro_template_pptx, working_dir, soffice_path)
-    else:
-        add_generated_intro_slide(
-            prs,
-            title=title,
-            subtitle="Generated from the uploaded Excel dashboard.",
-            logo_path=logo_path,
-        )
-
-    slide_w = 13.333
-    slide_h = 7.5
-    left_pad = 0.10
-    top_pad = 0.27
-    right_pad_before_sidebar = 0.15
-    content_w = slide_w - sidebar_width_inches - left_pad - right_pad_before_sidebar
-    content_h = 6.95
-
-    for sheet_name, img_path in zip(sheet_names, sheet_image_paths):
-        slide = prs.slides.add_slide(blank)
-
-        sidebar_left = Inches(slide_w - sidebar_width_inches)
-        sidebar_w = Inches(sidebar_width_inches)
-
-        sidebar = slide.shapes.add_shape(1, sidebar_left, 0, sidebar_w, prs.slide_height)
-        sidebar.fill.solid()
-        sidebar.fill.fore_color.rgb = SIDEBAR_BG
-        sidebar.line.fill.background()
-
-        divider = slide.shapes.add_shape(1, sidebar_left, Inches(0.2), 1, Inches(7.0))
-        divider.fill.solid()
-        divider.fill.fore_color.rgb = SIDEBAR_DIVIDER
-        divider.line.fill.background()
-
-        if logo_path and logo_path.exists():
-            logo_size = min(sidebar_width_inches - 0.22, 1.05)
-            logo_left = slide_w - sidebar_width_inches + (sidebar_width_inches - logo_size) / 2
-            slide.shapes.add_picture(
-                str(logo_path),
-                Inches(logo_left),
-                Inches(0.28),
-                width=Inches(logo_size),
-                height=Inches(logo_size),
-            )
-
-        if show_sheet_name:
-            box = slide.shapes.add_textbox(
-                Inches(slide_w - sidebar_width_inches + 0.04),
-                Inches(1.35),
-                Inches(sidebar_width_inches - 0.08),
-                Inches(4.8),
-            )
-            tf = box.text_frame
-            # Wrap long names (e.g. "MSB Full-Time Dashboard") inside the narrow
-            # sidebar instead of letting them overflow past the slide edge.
-            tf.word_wrap = True
-            label = "Nitty Gritty" if sheet_name == "NittyGrittySheet" else sheet_name
-            p = tf.paragraphs[0]
-            p.text = label
-            p.alignment = PP_ALIGN.CENTER
-            # Shrink the font a little for long labels so they wrap cleanly to a
-            # couple of lines rather than crowding the sidebar.
-            longest_word = max((len(w) for w in label.split()), default=len(label))
-            label_font = 10 if (len(label) <= 14 and longest_word <= 12) else 8
-            p.font.size = Pt(label_font)
-            p.font.bold = True
-            p.font.color.rgb = BYU_NAVY
-
-        image = Image.open(img_path)
-        iw, ih = image.size
-        scale = min((content_w * 96) / iw, (content_h * 96) / ih)
-        pic_w = Inches(iw / 96 * scale)
-        pic_h = Inches(ih / 96 * scale)
-        pic_left = Inches(left_pad) + (Inches(content_w) - pic_w) / 2
-        pic_top = Inches(top_pad) + (Inches(content_h) - pic_h) / 2
-
-        slide.shapes.add_picture(str(img_path), pic_left, pic_top, width=pic_w, height=pic_h)
-
-    prs.save(output_pptx)
-    return output_pptx
+def build_pdf(page_images: list[Image.Image], output_pdf: Path) -> Path:
+    rgb_pages = [img.convert("RGB") for img in page_images]
+    first, rest = rgb_pages[0], rgb_pages[1:]
+    first.save(output_pdf, "PDF", resolution=180.0, save_all=True, append_images=rest)
+    return output_pdf
 
 
 def make_zip(file_path: Path, zip_path: Path) -> Path:
@@ -616,514 +304,7 @@ def make_zip(file_path: Path, zip_path: Path) -> Path:
     return zip_path
 
 
-
-
-def set_weekly_chart_axis_to_show_latest_label(chart) -> None:
-    """Ask Excel/LibreOffice to draw all weekly category tick labels.
-
-    LibreOffice sometimes extends the chart data but still auto-skips the newest
-    x-axis label. This makes the final weekly pull, such as 5/22/2026, appear
-    on the axis instead of looking like the old chart stopped at 5/15/2026.
-    """
-    try:
-        chart.x_axis.tickLblSkip = 1
-        chart.x_axis.tickMarkSkip = 1
-        chart.x_axis.noMultiLvlLbl = False
-    except Exception:
-        pass
-
-
-def is_weekly_horizontal_chart(chart) -> bool:
-    for series in getattr(chart, "series", []):
-        cat = getattr(series, "cat", None)
-        if cat is None:
-            continue
-        for ref in (getattr(cat, "strRef", None), getattr(cat, "numRef", None)):
-            if ref and getattr(ref, "f", None) and get_horizontal_range_parts(ref.f):
-                return True
-    return False
-
-
-def normalize_weekly_chart_axes(wb) -> None:
-    for ws in wb.worksheets:
-        for chart in getattr(ws, "_charts", []):
-            if is_weekly_horizontal_chart(chart):
-                set_weekly_chart_axis_to_show_latest_label(chart)
-
-
-def parse_numeric(value) -> float | None:
-    if isinstance(value, Number):
-        return float(value)
-    if isinstance(value, str):
-        text = value.strip().replace(",", "")
-        if not text or text in {"-", "--", "—"}:
-            return None
-        is_percent = text.endswith("%")
-        if is_percent:
-            text = text[:-1].strip()
-        try:
-            parsed = float(text)
-            return parsed / 100 if is_percent else parsed
-        except ValueError:
-            return None
-    return None
-
-
-def find_weekly_block_rows(wb, sheet_name: str) -> tuple[int, int, int, dict[str, int]] | None:
-    """Return date/value rows for this dashboard's weekly charts.
-
-    The placement dashboards store weekly chart data in NittyGrittySheet.
-    For MSB, the block begins under "2026 MSB Weekly Placement". For each
-    major, the block begins at a row whose first cell matches the worksheet name.
-    """
-    if "NittyGrittySheet" not in wb.sheetnames or sheet_name == "NittyGrittySheet":
-        return None
-
-    ws = wb["NittyGrittySheet"]
-
-    if sheet_name == "MSB Full-Time Dashboard":
-        for row in range(1, ws.max_row + 1):
-            value = ws.cell(row=row, column=1).value
-            if isinstance(value, str) and "MSB Weekly Placement" in value:
-                return (
-                    row + 1,
-                    row + 2,
-                    row + 4,
-                    {
-                        "Accepted an offer": row + 5,
-                        "Actively seeking": row + 6,
-                        "Not Reported": row + 8,
-                    },
-                )
-        # Fallback for the known BYU Marriott dashboard layout.
-        return (23, 24, 26, {"Accepted an offer": 27, "Actively seeking": 28, "Not Reported": 30})
-
-    for row in range(1, ws.max_row + 1):
-        value = ws.cell(row=row, column=1).value
-        if isinstance(value, str) and value.strip() == sheet_name:
-            return (
-                row + 1,
-                row + 2,
-                row + 4,
-                {
-                    "Accepted an offer": row + 5,
-                    "Actively seeking": row + 6,
-                    "Not Reported": row + 8,
-                },
-            )
-
-    return None
-
-
-def extract_horizontal_weekly_series(
-    ws,
-    date_row: int,
-    value_row: int,
-    fallback_date_row: int | None = None,
-) -> tuple[list[date], list[float]]:
-    """Extract a date/value series across columns B:last.
-
-    If a status date row was not copied forward but the value row has newer
-    values, fallback_date_row lets the app borrow the matching date labels from
-    the placement date row. This prevents stale chart screenshots when future
-    weekly columns exist but one date row was not extended correctly.
-    """
-    dates: list[date] = []
-    values: list[float] = []
-    max_col = ws.max_column
-
-    for col in range(2, max_col + 1):
-        current_date = parse_excel_date(ws.cell(row=date_row, column=col).value)
-        if current_date is None and fallback_date_row is not None:
-            current_date = parse_excel_date(ws.cell(row=fallback_date_row, column=col).value)
-        if current_date is None:
-            continue
-
-        current_value = parse_numeric(ws.cell(row=value_row, column=col).value)
-        if current_value is None:
-            continue
-
-        dates.append(current_date)
-        values.append(current_value)
-
-    # Sort and dedupe by date, keeping the last value for duplicate dates.
-    deduped: dict[date, float] = {}
-    for d, v in zip(dates, values):
-        deduped[d] = v
-    sorted_items = sorted(deduped.items(), key=lambda item: item[0])
-    return [item[0] for item in sorted_items], [item[1] for item in sorted_items]
-
-
-
-
-def full_weekly_series(
-    dates: list[date],
-    values: list[float | None],
-) -> tuple[list[date], list[float | None]]:
-    """Return the full weekly series from the original start date to the newest date.
-
-    The rebuilt charts should not drop older points just because the newest pull
-    moved forward. This guarantees the x-axis can show the original starting
-    date, representative dates in between, and the most recent workbook date.
-    """
-    pairs: dict[date, float | None] = {}
-    for d, v in zip(dates, values):
-        pairs[d] = v
-    items = sorted(pairs.items(), key=lambda item: item[0])
-    return [d for d, _ in items], [v for _, v in items]
-
-
-def series_to_date_value_map(dates: list[date], values: list[float]) -> dict[date, float]:
-    mapped: dict[date, float] = {}
-    for d, v in zip(dates, values):
-        mapped[d] = v
-    return mapped
-
-
-def full_date_axis(date_lists: list[list[date]]) -> list[date]:
-    """Build one shared x-axis from the original start date to the newest date."""
-    return sorted({d for dates in date_lists for d in dates})
-
-def make_tick_indices(total_points: int, max_ticks: int = 18) -> list[int]:
-    """Pick Excel-style category labels anchored to real data points.
-
-    The older dashboard format looked best when date labels were tied to actual
-    weekly pull points, usually every other pull, while still forcing the first
-    and newest workbook dates to appear. This function never creates labels
-    between points; each label is placed on an existing data-point index.
-    """
-    if total_points <= 0:
-        return []
-    if total_points <= max_ticks:
-        return list(range(total_points))
-
-    max_ticks = max(2, max_ticks)
-    step = max(1, math.ceil((total_points - 1) / (max_ticks - 1)))
-    indices = list(range(0, total_points, step))
-    if indices[-1] != total_points - 1:
-        indices.append(total_points - 1)
-
-    # If appending the newest date pushed us over max_ticks, remove interior
-    # labels from the middle while preserving the first/latest anchors.
-    while len(indices) > max_ticks and len(indices) > 2:
-        middle_position = len(indices) // 2
-        indices.pop(middle_position)
-
-    return indices
-
-
-def date_label(d: date) -> str:
-    return f"{d.month}/{d.day}/{d.year}"
-
-
-# Render DPI for the rebuilt weekly charts. The figure is sized so that
-# (figure_inches * RENDER_DPI) equals the destination box in pixels exactly, so
-# the chart is never stretched or squished when pasted back onto the worksheet.
-CHART_RENDER_DPI = 160
-# Pixel height of the BYU Marriott weekly-chart box that the original good-looking
-# deck was tuned against. Font sizes scale relative to this so a smaller box gets
-# proportionally smaller text instead of oversized labels.
-CHART_REFERENCE_HEIGHT_PX = 450
-
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def render_rebuilt_line_chart(
-    output_path: Path,
-    dates: list[date],
-    series: dict[str, list[float | None]],
-    title: str,
-    y_label: str,
-    percent_axis: bool,
-    width_px: int,
-    height_px: int,
-    max_axis_labels: int = 10,
-) -> Path:
-    """Draw an Excel-style weekly line chart at an exact pixel size.
-
-    Robustness rules that fix the off-center / oversized-text / clipped-legend /
-    broken-chart problems:
-
-    1. The figure is rendered at EXACTLY ``width_px`` x ``height_px`` pixels, so
-       ``paste_chart`` never has to resize (and therefore never distorts) it.
-    2. Font sizes scale with the box height, so the typography looks the same on
-       a large or a small render instead of ballooning on small boxes.
-    3. ``layout="constrained"`` plus an *outside* bottom legend lets Matplotlib
-       reserve room for the rotated date labels and the legend automatically.
-       This holds even when the server lacks Calibri and falls back to the wider
-       DejaVu Sans font, which is what used to push text over the legend.
-    """
-    width_px = max(1, int(width_px))
-    height_px = max(1, int(height_px))
-
-    fig_w = width_px / CHART_RENDER_DPI
-    fig_h = height_px / CHART_RENDER_DPI
-
-    # Scale typography to the destination box. s == 1.0 reproduces the original
-    # good-looking deck; smaller boxes shrink the text proportionally.
-    s = _clamp(height_px / CHART_REFERENCE_HEIGHT_PX, 0.6, 1.5)
-    title_fs = 10.2 * s
-    ylabel_fs = 7.2 * s
-    ytick_fs = 6.7 * s
-    legend_fs = 6.3 * s
-
-    # Excel/PowerPoint-like font fallback. Calibri may not exist on Streamlit
-    # Cloud, so Arial/DejaVu Sans are safe fallbacks.
-    plt.rcParams.update({
-        "font.family": ["Calibri", "Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
-        "axes.edgecolor": "#D9D9D9",
-        "axes.linewidth": 0.8,
-    })
-
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=CHART_RENDER_DPI, layout="constrained")
-
-    x = list(range(len(dates)))
-    excel_colors = ["#156082", "#E97132", "#0F9ED5", "#70AD47", "#A5A5A5", "#7030A0"]
-    for idx, (label, values) in enumerate(series.items()):
-        # Matplotlib will leave a gap for missing values, but the x-axis will
-        # still include the newest workbook date.
-        ax.plot(
-            x,
-            values,
-            marker="o",
-            linewidth=1.7,
-            markersize=3.2,
-            label=label,
-            color=excel_colors[idx % len(excel_colors)],
-        )
-
-    tick_indices = make_tick_indices(len(dates), max_ticks=max_axis_labels)
-    ax.set_xticks(tick_indices)
-
-    # Date labels sit on real weekly data points and always include the first and
-    # newest workbook dates. ha="right" anchors each rotated label's end at its
-    # tick so the newest label can never overflow the right edge of the chart.
-    xtick_fs = (6.0 if len(tick_indices) <= 18 else 5.5) * s
-    ax.set_xticklabels(
-        [date_label(dates[i]) for i in tick_indices],
-        rotation=45,
-        rotation_mode="anchor",
-        ha="right",
-        va="top",
-        fontsize=xtick_fs,
-        color="#595959",
-    )
-    if dates:
-        # Small category margin so the first/last markers are not clipped.
-        ax.set_xlim(-0.7, len(dates) - 0.3)
-
-    # Match the compact Excel chart look instead of large Matplotlib defaults.
-    ax.set_title(title, fontsize=title_fs, color="#595959", pad=6, loc="left", fontweight="normal")
-    ax.set_ylabel(y_label, fontsize=ylabel_fs, color="#595959")
-    ax.grid(axis="y", color="#D9D9D9", linewidth=0.7)
-    ax.grid(axis="x", visible=False)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_color("#D9D9D9")
-    ax.spines["bottom"].set_color("#D9D9D9")
-    ax.tick_params(axis="y", labelsize=ytick_fs, colors="#595959", length=0)
-    ax.tick_params(axis="x", colors="#595959", length=0, pad=2)
-
-    if percent_axis:
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0%}"))
-        all_values = [v for values in series.values() for v in values if v is not None]
-        if all_values:
-            # Match the original Excel look: 10 percentage-point gridlines and
-            # a clean rounded upper bound such as 90% or 100%.
-            top = max(max(all_values) * 1.05, 0.10)
-            top = min(1.0, max(0.10, math.ceil(top * 10) / 10))
-            ax.set_ylim(0, top)
-            ax.set_yticks([i / 10 for i in range(0, int(round(top * 10)) + 1)])
-    else:
-        all_values = [v for values in series.values() for v in values if v is not None]
-        if all_values:
-            top = max(all_values) * 1.18
-            ax.set_ylim(0, top if top > 0 else 1)
-
-    # Put the legend OUTSIDE the axes at the bottom. With constrained layout this
-    # reserves its own space, so it can never cover the lines or the date labels.
-    if len(series) > 1:
-        fig.legend(
-            loc="outside lower center",
-            ncol=min(3, len(series)),
-            fontsize=legend_fs,
-            frameon=False,
-            handlelength=1.6,
-            handletextpad=0.35,
-            columnspacing=0.9,
-        )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    # Render at exactly width_px x height_px. No bbox_inches="tight" (which would
-    # change the output size); constrained layout already guarantees nothing is
-    # clipped while keeping the requested pixel dimensions.
-    fig.savefig(output_path, facecolor="white", dpi=CHART_RENDER_DPI)
-    plt.close(fig)
-    return output_path
-
-
-def paste_chart(image: Image.Image, chart_path: Path, box: tuple[int, int, int, int]) -> None:
-    """Cover the stale Excel chart with a clean white panel and paste the rebuilt
-    chart at its native size (no resizing, so no distortion)."""
-    left, top, right, bottom = box
-    box_w = max(1, right - left)
-    box_h = max(1, bottom - top)
-
-    draw = ImageDraw.Draw(image)
-    draw.rectangle(box, fill="white", outline=(225, 225, 225), width=1)
-
-    chart = Image.open(chart_path).convert("RGB")
-    # The chart is rendered at the box size, but guard against any off-by-one so
-    # it always fits inside the white panel without being stretched.
-    if chart.size != (box_w, box_h):
-        scale = min(box_w / chart.width, box_h / chart.height)
-        new_size = (max(1, int(chart.width * scale)), max(1, int(chart.height * scale)))
-        chart = chart.resize(new_size, Image.LANCZOS)
-
-    paste_x = left + (box_w - chart.width) // 2
-    paste_y = top + (box_h - chart.height) // 2
-    image.paste(chart, (paste_x, paste_y))
-
-
-def rebuild_weekly_charts_on_sheet_image(
-    image_path: Path,
-    output_path: Path,
-    data_workbook_path: Path,
-    sheet_name: str,
-    working_dir: Path,
-    weekly_axis_label_count: int = 10,
-) -> Path:
-    """Replace stale Excel-rendered weekly charts with freshly drawn charts.
-
-    This is the important fix for future weekly pulls. Excel/LibreOffice may
-    show a chart that visually stops at an older tick label even after formulas
-    are extended. This function reads the newest weekly data directly from
-    NittyGrittySheet and pastes newly rendered chart images over the two top
-    weekly charts, guaranteeing the original starting date and newest workbook date both appear on the x-axis.
-
-    IMPORTANT: ``data_workbook_path`` must be the ORIGINAL uploaded workbook, not
-    a copy that has been re-saved by openpyxl. openpyxl drops Excel's cached
-    formula results when it re-saves a file, so reading values from a re-saved
-    copy returns ``None`` for any formula cell (for example a live "=" formula in
-    the newest 6/5 column). Reading the original Excel file keeps those cached
-    values, so the most recent weekly pull is included instead of being dropped.
-    """
-    def _keep_original() -> Path:
-        """Return the untouched screenshot when this sheet is not a weekly
-        dashboard, so non-NittyGritty sheets render exactly as Excel drew them."""
-        if image_path == output_path:
-            return image_path
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        Image.open(image_path).convert("RGB").save(output_path)
-        return output_path
-
-    wb = load_workbook(data_workbook_path, data_only=True)
-    rows = find_weekly_block_rows(wb, sheet_name)
-    if rows is None:
-        return _keep_original()
-
-    date_row, placement_value_row, status_date_row, status_rows = rows
-    ws = wb["NittyGrittySheet"]
-
-    placement_dates, placement_values = extract_horizontal_weekly_series(ws, date_row, placement_value_row)
-    placement_dates, placement_values = full_weekly_series(placement_dates, placement_values)
-    if len(placement_dates) < 2:
-        return _keep_original()
-
-    # Build the status (count) series on the SAME weekly date axis as the
-    # placement chart so both charts line up and run through the newest pull.
-    #
-    # A dash ("-") or blank cell in a count row means zero students in that
-    # category that week, not "missing data". The old code skipped those cells,
-    # which made a series like "Not Reported" break and stop early (the symptom
-    # seen on BSAcc). We now treat dash/blank as 0 so every line stays continuous
-    # all the way to the newest date, while still dropping a category that has no
-    # real numbers at all.
-    def _status_value_map(value_row: int) -> tuple[dict[date, float], int]:
-        mapping: dict[date, float] = {}
-        real_numeric = 0
-        max_col = ws.max_column
-        for col in range(2, max_col + 1):
-            cell_date = parse_excel_date(ws.cell(row=status_date_row, column=col).value)
-            if cell_date is None:
-                cell_date = parse_excel_date(ws.cell(row=date_row, column=col).value)
-            if cell_date is None:
-                continue
-            raw = ws.cell(row=value_row, column=col).value
-            number = parse_numeric(raw)
-            if number is None:
-                if raw is None or (isinstance(raw, str) and raw.strip() in {"", "-", "--", "\u2014"}):
-                    number = 0.0  # dash/blank in a count column == zero students
-                else:
-                    continue
-            else:
-                real_numeric += 1
-            mapping[cell_date] = number
-        return mapping, real_numeric
-
-    status_dates = placement_dates  # share the placement chart's full timeline
-    status_series: dict[str, list[float | None]] = {}
-    for label, value_row in status_rows.items():
-        mapping, real_numeric = _status_value_map(value_row)
-        if real_numeric >= 2:  # ignore a category that never has real numbers
-            status_series[label] = [mapping.get(d, 0.0) for d in status_dates]
-    if not status_series:
-        status_dates = []
-
-    image = Image.open(image_path).convert("RGB")
-    width, height = image.size
-
-    # These boxes match the BYU Marriott placement dashboard screenshot layout.
-    left_chart_box = (
-        int(width * 0.018),
-        int(height * 0.058),
-        int(width * 0.490),
-        int(height * 0.455),
-    )
-    right_chart_box = (
-        int(width * 0.510),
-        int(height * 0.058),
-        int(width * 0.982),
-        int(height * 0.455),
-    )
-
-    chart_dir = working_dir / "rebuilt_weekly_charts"
-    placement_chart = chart_dir / f"{sanitize_filename(sheet_name)}_placement.png"
-    render_rebuilt_line_chart(
-        placement_chart,
-        placement_dates,
-        {"% Placed": placement_values},
-        "Weekly 2026 Placement Trend" if sheet_name == "MSB Full-Time Dashboard" else "Weekly Placement Trend",
-        "% of Seeking Students Placed",
-        True,
-        left_chart_box[2] - left_chart_box[0],
-        left_chart_box[3] - left_chart_box[1],
-        max_axis_labels=weekly_axis_label_count,
-    )
-    paste_chart(image, placement_chart, left_chart_box)
-
-    if status_dates and status_series:
-        status_chart = chart_dir / f"{sanitize_filename(sheet_name)}_status.png"
-        render_rebuilt_line_chart(
-            status_chart,
-            status_dates,
-            status_series,
-            "Weekly 2026 Search Status" if sheet_name == "MSB Full-Time Dashboard" else "Weekly Search Status",
-            "# of Students",
-            False,
-            right_chart_box[2] - right_chart_box[0],
-            right_chart_box[3] - right_chart_box[1],
-            max_axis_labels=weekly_axis_label_count,
-        )
-        paste_chart(image, status_chart, right_chart_box)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path, quality=95, optimize=True)
-    return output_path
-
-def convert_excel_to_pptx(
+def convert_excel_to_pdf(
     uploaded_excel,
     selected_sheets: list[str],
     uploaded_logo,
@@ -1131,21 +312,13 @@ def convert_excel_to_pptx(
     title: str,
     fit_each_sheet_to_one_page: bool,
     crop_pages: bool,
-    make_logo_transparent: bool,
     show_sheet_name: bool,
     dpi: int,
-    sidebar_width: float,
     margins: float,
-    auto_extend_latest_date: bool,
-    cap_chart_dates_at_today: bool,
-    rebuild_weekly_charts: bool,
-    weekly_axis_label_count: int,
 ) -> tuple[bytes, bytes, str]:
     soffice_path = find_soffice()
     if not soffice_path:
-        raise RuntimeError(
-            "LibreOffice was not found. Install LibreOffice locally, or deploy with packages.txt on Streamlit Cloud."
-        )
+        raise RuntimeError("LibreOffice was not found. Install LibreOffice locally or through packages.txt.")
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
@@ -1155,10 +328,7 @@ def convert_excel_to_pptx(
         if uploaded_logo:
             raw_logo = save_upload(uploaded_logo, tmpdir / sanitize_filename(uploaded_logo.name))
             logo_path = tmpdir / "logo.png"
-            if make_logo_transparent:
-                make_circular_logo_transparent(raw_logo, logo_path)
-            else:
-                logo_path = raw_logo
+            ellipse_transparent_logo(raw_logo, logo_path)
         elif DEFAULT_LOGO.exists():
             logo_path = DEFAULT_LOGO
 
@@ -1166,163 +336,65 @@ def convert_excel_to_pptx(
         if uploaded_intro_pptx:
             intro_template = save_upload(uploaded_intro_pptx, tmpdir / sanitize_filename(uploaded_intro_pptx.name))
 
-        prepared_xlsx = tmpdir / "prepared_dashboard.xlsx"
-        # When weekly charts are rebuilt from NittyGrittySheet, do not also
-        # rewrite the workbook's native chart XML. That legacy chart-range
-        # repair can make unrelated Excel-rendered charts on other slides look
-        # broken. The rebuilt weekly overlays already guarantee the newest date.
-        should_auto_extend_native_charts = auto_extend_latest_date and not rebuild_weekly_charts
-
+        prepared_xlsx = tmpdir / "prepared.xlsx"
         rendered_sheet_names = prepare_workbook_for_rendering(
             excel_path,
             prepared_xlsx,
             selected_sheets,
             fit_each_sheet_to_one_page,
             margins,
-            should_auto_extend_native_charts,
-            cap_chart_dates_at_today,
         )
 
-        pdf_path = convert_to_pdf(prepared_xlsx, tmpdir / "pdf", soffice_path)
-        page_images = pdf_to_images(pdf_path, tmpdir / "pages", dpi=dpi)
-
+        pdf_path = convert_to_pdf(prepared_xlsx, tmpdir / "rendered_pdf", soffice_path)
+        page_images = pdf_to_images(pdf_path, tmpdir / "sheet_pages", dpi=dpi)
         if len(page_images) < len(rendered_sheet_names):
-            raise RuntimeError(
-                f"Expected at least {len(rendered_sheet_names)} rendered pages, but got {len(page_images)}. "
-                "Try selecting fewer sheets or disabling one-page fitting."
-            )
+            raise RuntimeError(f"Expected {len(rendered_sheet_names)} pages, but LibreOffice rendered only {len(page_images)}.")
 
-        final_images = []
-        for index, img_path in enumerate(page_images[: len(rendered_sheet_names)], start=1):
-            sheet_name = rendered_sheet_names[index - 1]
+        screenshot_paths = []
+        for idx, img_path in enumerate(page_images[:len(rendered_sheet_names)], start=1):
             working = img_path
             if crop_pages:
-                cropped = tmpdir / "cropped" / f"sheet_{index:02d}.png"
+                cropped = tmpdir / "cropped" / f"sheet_{idx:02d}.png"
                 cropped.parent.mkdir(exist_ok=True)
                 working = crop_white_space(working, cropped)
+            resized = tmpdir / "resized" / f"sheet_{idx:02d}.jpg"
+            resized.parent.mkdir(exist_ok=True)
+            working = resize_for_page(working, resized)
+            screenshot_paths.append(working)
 
-            if rebuild_weekly_charts:
-                rebuilt = tmpdir / "rebuilt_sheets" / f"sheet_{index:02d}.png"
-                rebuilt.parent.mkdir(exist_ok=True)
-                try:
-                    working = rebuild_weekly_charts_on_sheet_image(
-                        working,
-                        rebuilt,
-                        excel_path,
-                        sheet_name,
-                        tmpdir,
-                        weekly_axis_label_count=weekly_axis_label_count,
-                    )
-                except Exception:
-                    # Keep the normal Excel screenshot if a workbook does not use
-                    # the BYU Marriott NittyGrittySheet dashboard layout.
-                    pass
+        final_pages = []
+        if intro_template:
+            intro = extract_intro_page(intro_template, tmpdir, soffice_path)
+            intro = intro.resize((PAGE_W, PAGE_H), Image.LANCZOS)
+            final_pages.append(intro)
+        else:
+            final_pages.append(create_generated_intro_page(title, logo_path))
 
-            optimized = tmpdir / "optimized" / f"sheet_{index:02d}.jpg"
-            optimized.parent.mkdir(exist_ok=True)
-            working = resize_for_ppt(working, optimized)
-            final_images.append(working)
+        for sheet_name, img_path in zip(rendered_sheet_names, screenshot_paths):
+            final_pages.append(make_sheet_page(img_path, sheet_name, logo_path, show_sheet_name))
 
         safe_title = sanitize_filename(title.replace(" ", "_"))
-        pptx_path = tmpdir / f"{safe_title}.pptx"
-        build_powerpoint(
-            final_images,
-            rendered_sheet_names,
-            pptx_path,
-            logo_path,
-            intro_template,
-            tmpdir,
-            soffice_path,
-            show_sheet_name,
-            sidebar_width,
-            title,
-        )
+        final_pdf = tmpdir / f"{safe_title}.pdf"
+        build_pdf(final_pages, final_pdf)
 
         zip_path = tmpdir / f"{safe_title}.zip"
-        make_zip(pptx_path, zip_path)
+        make_zip(final_pdf, zip_path)
+        return final_pdf.read_bytes(), zip_path.read_bytes(), final_pdf.name
 
-        return pptx_path.read_bytes(), zip_path.read_bytes(), pptx_path.name
-
-
-def get_sheet_names_from_upload(uploaded_excel) -> list[str]:
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        tmp.write(uploaded_excel.getbuffer())
-        tmp_path = Path(tmp.name)
-    try:
-        wb = load_workbook(tmp_path, read_only=True)
-        return wb.sheetnames
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-
-
-
-
-def get_newest_date_from_upload(uploaded_excel) -> date | None:
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        tmp.write(uploaded_excel.getbuffer())
-        tmp_path = Path(tmp.name)
-    try:
-        wb = load_workbook(tmp_path, read_only=True, data_only=False)
-        newest = None
-        for ws in wb.worksheets:
-            for row in ws.iter_rows():
-                for cell in row:
-                    parsed = parse_excel_date(cell.value)
-                    if parsed and (newest is None or parsed > newest):
-                        newest = parsed
-        return newest
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-
-
-def format_date_for_display(value: date) -> str:
-    return f"{value.month}/{value.day}/{value.year}"
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
-
-    st.title("📊 Excel to PowerPoint Dashboard Builder")
-    st.caption("Upload an Excel dashboard and turn every worksheet into a clean PowerPoint slide.")
+    st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
+    st.title("📄 Excel Screenshot to PDF Builder")
+    st.caption("Upload an Excel workbook and export worksheet screenshots into a PDF. No chart rebuilding — the worksheet screenshot stays in the Excel-rendered style.")
 
     with st.sidebar:
         st.header("Settings")
-        title = st.text_input("Output deck name", value="Placement_Report_Updated")
+        title = st.text_input("Output file name", value="Placement_Report_Screenshots")
         fit_one_page = st.checkbox("Fit each worksheet to one landscape page", value=True)
         crop_pages = st.checkbox("Crop extra white space around screenshots", value=True)
         show_sheet_name = st.checkbox("Show sheet name in the right sidebar", value=True)
-        make_logo_transparent = st.checkbox("Remove outside background from circular logo", value=True)
-        dpi = st.slider("Screenshot resolution", min_value=120, max_value=260, value=190, step=10)
-        sidebar_width = st.slider("Right logo sidebar width", min_value=0.8, max_value=1.6, value=1.2, step=0.05)
+        dpi = st.slider("Screenshot resolution", min_value=140, max_value=260, value=190, step=10)
         margins = st.slider("Excel print margins", min_value=0.05, max_value=0.40, value=0.20, step=0.05)
-        auto_extend_latest_date = st.checkbox(
-            "Legacy native Excel chart range repair",
-            value=False,
-            help="Usually leave this OFF. The app now rebuilds weekly charts from NittyGrittySheet, which is safer. Turn this on only for older workbooks where you want the app to edit the workbook's native chart ranges before LibreOffice renders them.",
-        )
-        cap_chart_dates_at_today = st.checkbox(
-            "Ignore dates after today",
-            value=False,
-            help="Leave this off for normal use. Turn it on only if your workbook contains blank future placeholder dates that should not appear yet.",
-        )
-        rebuild_weekly_charts = st.checkbox(
-            "Rebuild weekly charts from NittyGrittySheet",
-            value=True,
-            help="Recommended. Replaces only the two top weekly charts with fresh charts from NittyGrittySheet, while leaving the other Excel-rendered charts alone.",
-        )
-        weekly_axis_label_count = st.slider(
-            "Weekly x-axis date labels",
-            min_value=8,
-            max_value=24,
-            value=18,
-            step=1,
-            help="Matches the older dashboard look: labels are placed only on real weekly data points, always including the original starting date and newest workbook date.",
-        )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1330,9 +402,9 @@ def main() -> None:
         logo_upload = st.file_uploader("Optional logo image (.png, .jpg)", type=["png", "jpg", "jpeg"])
     with col2:
         intro_upload = st.file_uploader(
-            "Optional PowerPoint template for intro slide (.pptx)",
+            "Optional PowerPoint template for intro page (.pptx)",
             type=["pptx"],
-            help="If you upload your old deck, the app will use slide 1 as the intro slide.",
+            help="If you upload an older deck, the app will reuse page 1 as the intro page.",
         )
 
     if not excel_upload:
@@ -1345,24 +417,14 @@ def main() -> None:
         st.error(f"Could not read the workbook: {exc}")
         return
 
-    newest_workbook_date = get_newest_date_from_upload(excel_upload)
-    if newest_workbook_date:
-        st.info(f"Newest date detected in this workbook: **{format_date_for_display(newest_workbook_date)}**")
-
     st.subheader("Sheets to include")
-    default_sheets = sheet_names
-    selected_sheets = st.multiselect(
-        "Choose sheets and order them",
-        options=sheet_names,
-        default=default_sheets,
-    )
-
+    selected_sheets = st.multiselect("Choose sheets and order them", options=sheet_names, default=sheet_names)
     st.write(f"Selected **{len(selected_sheets)}** sheet(s).")
 
-    if st.button("Generate PowerPoint", type="primary", disabled=not selected_sheets):
+    if st.button("Generate PDF", type="primary", disabled=not selected_sheets):
         try:
-            with st.spinner("Rendering Excel sheets and building PowerPoint..."):
-                pptx_bytes, zip_bytes, pptx_name = convert_excel_to_pptx(
+            with st.spinner("Rendering workbook screenshots and building PDF..."):
+                pdf_bytes, zip_bytes, pdf_name = convert_excel_to_pdf(
                     uploaded_excel=excel_upload,
                     selected_sheets=selected_sheets,
                     uploaded_logo=logo_upload,
@@ -1370,35 +432,26 @@ def main() -> None:
                     title=title,
                     fit_each_sheet_to_one_page=fit_one_page,
                     crop_pages=crop_pages,
-                    make_logo_transparent=make_logo_transparent,
                     show_sheet_name=show_sheet_name,
                     dpi=dpi,
-                    sidebar_width=sidebar_width,
                     margins=margins,
-                    auto_extend_latest_date=auto_extend_latest_date,
-                    cap_chart_dates_at_today=cap_chart_dates_at_today,
-                    rebuild_weekly_charts=rebuild_weekly_charts,
-                    weekly_axis_label_count=weekly_axis_label_count,
                 )
-
-            st.success("PowerPoint created successfully.")
+            st.success("PDF created successfully.")
             st.download_button(
-                "Download PowerPoint",
-                data=pptx_bytes,
-                file_name=pptx_name,
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "Download PDF",
+                data=pdf_bytes,
+                file_name=pdf_name,
+                mime="application/pdf",
             )
             st.download_button(
                 "Download ZIP",
                 data=zip_bytes,
-                file_name=pptx_name.replace(".pptx", ".zip"),
+                file_name=pdf_name.replace('.pdf', '.zip'),
                 mime="application/zip",
             )
         except Exception as exc:
             st.error(str(exc))
-            st.caption(
-                "Common fix: make sure LibreOffice is installed locally, or include packages.txt when deploying to Streamlit Cloud."
-            )
+            st.caption("Make sure LibreOffice is available locally or via packages.txt on Streamlit Cloud.")
 
 
 if __name__ == "__main__":
