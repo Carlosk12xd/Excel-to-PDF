@@ -1032,19 +1032,45 @@ def rebuild_weekly_charts_on_sheet_image(
     if len(placement_dates) < 2:
         return _keep_original()
 
-    status_maps: dict[str, dict[date, float]] = {}
-    status_date_lists: list[list[date]] = []
-    for label, row in status_rows.items():
-        dts, vals = extract_horizontal_weekly_series(ws, status_date_row, row, fallback_date_row=date_row)
-        if len(dts) >= 2:
-            status_maps[label] = series_to_date_value_map(dts, vals)
-            status_date_lists.append(dts)
+    # Build the status (count) series on the SAME weekly date axis as the
+    # placement chart so both charts line up and run through the newest pull.
+    #
+    # A dash ("-") or blank cell in a count row means zero students in that
+    # category that week, not "missing data". The old code skipped those cells,
+    # which made a series like "Not Reported" break and stop early (the symptom
+    # seen on BSAcc). We now treat dash/blank as 0 so every line stays continuous
+    # all the way to the newest date, while still dropping a category that has no
+    # real numbers at all.
+    def _status_value_map(value_row: int) -> tuple[dict[date, float], int]:
+        mapping: dict[date, float] = {}
+        real_numeric = 0
+        max_col = ws.max_column
+        for col in range(2, max_col + 1):
+            cell_date = parse_excel_date(ws.cell(row=status_date_row, column=col).value)
+            if cell_date is None:
+                cell_date = parse_excel_date(ws.cell(row=date_row, column=col).value)
+            if cell_date is None:
+                continue
+            raw = ws.cell(row=value_row, column=col).value
+            number = parse_numeric(raw)
+            if number is None:
+                if raw is None or (isinstance(raw, str) and raw.strip() in {"", "-", "--", "\u2014"}):
+                    number = 0.0  # dash/blank in a count column == zero students
+                else:
+                    continue
+            else:
+                real_numeric += 1
+            mapping[cell_date] = number
+        return mapping, real_numeric
 
-    status_dates = full_date_axis(status_date_lists) if status_date_lists else []
-    status_series: dict[str, list[float | None]] = {
-        label: [mapped.get(d) for d in status_dates]
-        for label, mapped in status_maps.items()
-    }
+    status_dates = placement_dates  # share the placement chart's full timeline
+    status_series: dict[str, list[float | None]] = {}
+    for label, value_row in status_rows.items():
+        mapping, real_numeric = _status_value_map(value_row)
+        if real_numeric >= 2:  # ignore a category that never has real numbers
+            status_series[label] = [mapping.get(d, 0.0) for d in status_dates]
+    if not status_series:
+        status_dates = []
 
     image = Image.open(image_path).convert("RGB")
     width, height = image.size
