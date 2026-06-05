@@ -11,6 +11,7 @@ What it does:
 5. It builds a PowerPoint with one slide per worksheet.
 6. It keeps an optional first slide from an uploaded PowerPoint template.
 7. It places the BYU Marriott logo in a right sidebar without blocking the data.
+8. For placement dashboard files, it can rebuild the two top weekly charts from `NittyGrittySheet` so the newest workbook pull date is included.
 
 ## Local setup
 
@@ -48,36 +49,19 @@ Then deploy the repo on Streamlit Cloud.
 - Uploading a PowerPoint template is optional. When uploaded, the app uses the first slide as the intro slide.
 - If you do not upload a logo, the app uses `assets/default_logo.png`.
 
-
 ## Future-date chart handling
 
-This version automatically extends horizontal Excel chart ranges to the newest date found in the uploaded workbook. It is not hardcoded to 5/15, 5/22, or any specific pull date. If a future workbook includes 5/29, 6/5, or another later weekly pull, the app will extend the chart ranges to that newest workbook date.
+This version is not hardcoded to 5/15, 5/22, 6/5, or any specific pull date. It scans the uploaded workbook and uses the newest weekly pull date found in the data.
 
-The sidebar includes two controls:
+For BYU Marriott placement dashboards, keep **Rebuild weekly charts from NittyGrittySheet** turned on. The app rebuilds the weekly placement and weekly search-status charts directly from workbook data instead of relying on stale Excel chart rendering.
 
-- **Auto-extend charts to newest workbook date**: keep this on for normal use.
-- **Ignore dates after today**: leave this off unless your workbook contains blank future placeholder columns that should not show yet.
+The rebuilt weekly charts now match the older dashboard style more closely:
 
+- full timeline from the original starting date to the newest workbook date
+- x-axis labels placed only on real weekly data points
+- first/original date always included
+- newest workbook date always included
+- regular data-point labels in between, similar to the older chart format
+- smaller Excel-style text so labels do not block the chart
 
-## Fix for stale weekly chart screenshots
-
-This version does more than detect the newest workbook date. It also rebuilds the two top weekly charts from `NittyGrittySheet` before placing the worksheet screenshots into PowerPoint. This fixes the issue where the app detected 5/22 or a newer pull date, but the Excel-rendered screenshot still visually stopped at 5/15.
-
-Keep **Rebuild weekly charts from NittyGrittySheet** turned on for placement dashboard files.
-
-
-## Force newest weekly pull into charts
-
-This version also supports a rolling weekly-chart window. Keep **Rebuild weekly charts from NittyGrittySheet** turned on and use **Weekly chart window: newest date plus previous pulls**. The app rebuilds the two top weekly charts from workbook data and uses the newest date found in the uploaded file as the rightmost point. For example, if the uploaded workbook includes `6/5/2026`, the rebuilt weekly charts end at `6/5/2026`; if the next upload includes `6/12/2026`, they end at `6/12/2026`.
-
-Recommended setting: `10`, which shows the newest pull plus the previous weekly pulls, roughly the last two months.
-
-## Full weekly timeline with endpoint labels
-
-The weekly charts now keep the full available timeline from the original starting date through the newest workbook date. The x-axis labels always include:
-
-- the original starting date
-- the most recent workbook date
-- evenly spaced dates in between
-
-Use **Weekly x-axis date labels** to control how many labels appear. The data line still includes every weekly pull; the setting only controls which dates are printed on the x-axis so the chart remains readable.
+Recommended setting: **Weekly x-axis date labels = 18**.

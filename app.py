@@ -773,24 +773,32 @@ def full_date_axis(date_lists: list[list[date]]) -> list[date]:
     """Build one shared x-axis from the original start date to the newest date."""
     return sorted({d for dates in date_lists for d in dates})
 
-def make_tick_indices(total_points: int, max_ticks: int = 10) -> list[int]:
-    """Pick x-axis labels that always include the first and last dates.
+def make_tick_indices(total_points: int, max_ticks: int = 18) -> list[int]:
+    """Pick Excel-style category labels anchored to real data points.
 
-    The chart keeps every data point, but the axis only labels a readable subset:
-    original starting date, most recent date, and evenly spaced dates in between.
-    This is intentionally deterministic rather than truly random so repeated
-    exports of the same workbook look consistent.
+    The older dashboard format looked best when date labels were tied to actual
+    weekly pull points, usually every other pull, while still forcing the first
+    and newest workbook dates to appear. This function never creates labels
+    between points; each label is placed on an existing data-point index.
     """
     if total_points <= 0:
         return []
     if total_points <= max_ticks:
         return list(range(total_points))
+
     max_ticks = max(2, max_ticks)
-    indices = {0, total_points - 1}
-    for i in range(1, max_ticks - 1):
-        idx = round(i * (total_points - 1) / (max_ticks - 1))
-        indices.add(idx)
-    return sorted(indices)
+    step = max(1, math.ceil((total_points - 1) / (max_ticks - 1)))
+    indices = list(range(0, total_points, step))
+    if indices[-1] != total_points - 1:
+        indices.append(total_points - 1)
+
+    # If appending the newest date pushed us over max_ticks, remove interior
+    # labels from the middle while preserving the first/latest anchors.
+    while len(indices) > max_ticks and len(indices) > 2:
+        middle_position = len(indices) // 2
+        indices.pop(middle_position)
+
+    return indices
 
 
 def date_label(d: date) -> str:
@@ -846,13 +854,16 @@ def render_rebuilt_line_chart(
     tick_indices = make_tick_indices(len(dates), max_ticks=max_axis_labels)
     ax.set_xticks(tick_indices)
 
-    # Keep the original-style m/d/yyyy labels, but make them small enough to fit.
-    # More labels = slightly smaller font so dates do not cover the plot.
-    x_label_font = 6.4 if len(tick_indices) <= 10 else 5.8
+    # Keep the original-style m/d/yyyy labels, anchored directly to their
+    # corresponding data points. rotation_mode="anchor" keeps the label's
+    # right edge attached to the tick, matching Excel/LibreOffice more closely.
+    x_label_font = 6.1 if len(tick_indices) <= 18 else 5.6
     ax.set_xticklabels(
         [date_label(dates[i]) for i in tick_indices],
         rotation=45,
+        rotation_mode="anchor",
         ha="right",
+        va="top",
         fontsize=x_label_font,
         color="#595959",
     )
@@ -869,14 +880,18 @@ def render_rebuilt_line_chart(
     ax.spines["left"].set_color("#D9D9D9")
     ax.spines["bottom"].set_color("#D9D9D9")
     ax.tick_params(axis="y", labelsize=6.7, colors="#595959", length=0)
-    ax.tick_params(axis="x", colors="#595959", length=0)
+    ax.tick_params(axis="x", colors="#595959", length=0, pad=2)
 
     if percent_axis:
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0%}"))
         all_values = [v for values in series.values() for v in values if v is not None]
         if all_values:
-            top = max(max(all_values) * 1.15, 0.10)
-            ax.set_ylim(0, min(max(top, 0.10), 1.0))
+            # Match the original Excel look: 10 percentage-point gridlines and
+            # a clean rounded upper bound such as 90% or 100%.
+            top = max(max(all_values) * 1.05, 0.10)
+            top = min(1.0, max(0.10, math.ceil(top * 10) / 10))
+            ax.set_ylim(0, top)
+            ax.set_yticks([i / 10 for i in range(0, int(round(top * 10)) + 1)])
     else:
         all_values = [v for values in series.values() for v in values if v is not None]
         if all_values:
@@ -1202,11 +1217,11 @@ def main() -> None:
         )
         weekly_axis_label_count = st.slider(
             "Weekly x-axis date labels",
-            min_value=4,
-            max_value=14,
-            value=10,
+            min_value=8,
+            max_value=24,
+            value=18,
             step=1,
-            help="The rebuilt weekly charts keep the full timeline from the original starting date to the newest workbook date. This controls how many date labels appear: first date, newest date, and evenly spaced dates in between.",
+            help="Matches the older dashboard look: labels are placed only on real weekly data points, always including the original starting date and newest workbook date.",
         )
 
     col1, col2 = st.columns(2)
