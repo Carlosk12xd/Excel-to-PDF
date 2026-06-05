@@ -1,11 +1,10 @@
-import io
+import re
 import shutil
 import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
 
-import fitz  # PyMuPDF
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -28,13 +27,55 @@ TITLE_COLOR = (16, 49, 101)
 TEXT_COLOR = (45, 45, 45)
 
 
+def flatten_to_rgb(image: Image.Image, background=(255, 255, 255)) -> Image.Image:
+    """Return an RGB image, safely flattening transparency onto a white background.
+
+    Pillow's PDF writer expects RGB/CMYK/L images. Uploaded logos and PNGs often
+    arrive as RGBA, LA, or P-with-transparency images; passing those through can
+    raise errors like "image has wrong mode." This helper normalizes every image
+    before PDF export or compositing.
+    """
+    if image.mode == "RGB":
+        return image
+    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        bg = Image.new("RGBA", rgba.size, background + (255,))
+        bg.alpha_composite(rgba)
+        return bg.convert("RGB")
+    return image.convert("RGB")
+
+
+def paste_transparent(base: Image.Image, overlay: Image.Image, xy: tuple[int, int]) -> Image.Image:
+    """Safely paste a transparent PNG/logo onto an RGB page.
+
+    This avoids Pillow mode/mask issues by doing the composite in RGBA mode and
+    then converting back to RGB for PDF output.
+    """
+    base_rgba = base.convert("RGBA")
+    overlay_rgba = overlay.convert("RGBA")
+    base_rgba.alpha_composite(overlay_rgba, dest=(int(xy[0]), int(xy[1])))
+    return base_rgba.convert("RGB")
+
+
 def find_soffice() -> str | None:
     candidates = [
         shutil.which("soffice"),
         shutil.which("libreoffice"),
-        r"C:\Program Files\LibreOffice\program\soffice.exe",
-        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        r"C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+        r"C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
         "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(candidate)
+    return None
+
+
+def find_pdftoppm() -> str | None:
+    candidates = [
+        shutil.which("pdftoppm"),
+        r"C:\\Program Files\\poppler\\Library\\bin\\pdftoppm.exe",
+        r"C:\\poppler\\Library\\bin\\pdftoppm.exe",
     ]
     for candidate in candidates:
         if candidate and Path(candidate).exists():
@@ -134,7 +175,7 @@ def convert_to_pdf(input_file: Path, output_dir: Path, soffice_path: str) -> Pat
         str(output_dir),
         str(input_file),
     ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=240)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
     if result.returncode != 0:
         raise RuntimeError(
             "LibreOffice failed to convert the file to PDF.\n\n"
@@ -150,18 +191,39 @@ def convert_to_pdf(input_file: Path, output_dir: Path, soffice_path: str) -> Pat
     return pdf_path
 
 
-def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int) -> list[Path]:
+def _page_sort_key(path: Path) -> tuple[int, str]:
+    # pdftoppm names files like prefix-1.png, prefix-01.png, or prefix-001.png.
+    match = re.search(r"-(\d+)\.png$", path.name)
+    return (int(match.group(1)) if match else 10**9, path.name)
+
+
+def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int, first_page: int | None = None, last_page: int | None = None) -> list[Path]:
+    pdftoppm = find_pdftoppm()
+    if not pdftoppm:
+        raise RuntimeError(
+            "Poppler was not found. Add poppler-utils to packages.txt on Streamlit Cloud, "
+            "or install Poppler locally."
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open(str(pdf_path))
-    image_paths = []
-    matrix = fitz.Matrix(dpi / 72, dpi / 72)
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        out_path = output_dir / f"page_{page_index + 1:02d}.png"
-        pix.save(str(out_path))
-        image_paths.append(out_path)
-    doc.close()
+    output_prefix = output_dir / "page"
+    cmd = [pdftoppm, "-png", "-r", str(dpi)]
+    if first_page is not None:
+        cmd.extend(["-f", str(first_page)])
+    if last_page is not None:
+        cmd.extend(["-l", str(last_page)])
+    cmd.extend([str(pdf_path), str(output_prefix)])
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Poppler failed to render PDF pages.\n\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        )
+
+    image_paths = sorted(output_dir.glob("page-*.png"), key=_page_sort_key)
+    if not image_paths:
+        raise FileNotFoundError("Poppler did not create any PNG page images.")
     return image_paths
 
 
@@ -206,6 +268,7 @@ def ellipse_transparent_logo(source: Path, output: Path) -> Path:
 def load_font(size: int, bold: bool = False):
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
         "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
         "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
     ]
@@ -238,28 +301,26 @@ def create_generated_intro_page(title: str, logo_path: Path | None) -> Image.Ima
     draw = ImageDraw.Draw(page)
     draw.rectangle((0, 0, PAGE_W, 95), fill=(16, 49, 101))
     title_font = load_font(54, bold=True)
-    subtitle_font = load_font(28, bold=False)
+    subtitle_font = load_font(28)
     draw.text((120, 210), title, fill=TITLE_COLOR, font=title_font)
     draw.text((120, 300), "Generated from the uploaded Excel workbook.", fill=TEXT_COLOR, font=subtitle_font)
     if logo_path and logo_path.exists():
         logo = Image.open(logo_path).convert("RGBA")
         logo.thumbnail((300, 300), Image.LANCZOS)
-        page.alpha_composite(logo, (1450, 150))
-    return page.convert("RGB")
+        page = paste_transparent(page, logo, (1450, 150))
+    return flatten_to_rgb(page)
 
 
 def extract_intro_page(template_pptx: Path, working_dir: Path, soffice_path: str) -> Image.Image:
     pdf_path = convert_to_pdf(template_pptx, working_dir / "template_pdf", soffice_path)
-    pages = pdf_to_images(pdf_path, working_dir / "template_pages", dpi=170)
-    if not pages:
-        raise RuntimeError("Could not render the template PowerPoint.")
-    return Image.open(pages[0]).convert("RGB")
+    pages = pdf_to_images(pdf_path, working_dir / "template_pages", dpi=170, first_page=1, last_page=1)
+    return flatten_to_rgb(Image.open(pages[0]))
 
 
 def make_sheet_page(sheet_img_path: Path, sheet_name: str, logo_path: Path | None, show_sheet_name: bool) -> Image.Image:
     page = Image.new("RGB", (PAGE_W, PAGE_H), "white")
     draw = ImageDraw.Draw(page)
-    # sidebar
+
     sidebar_x = PAGE_W - SIDEBAR_W
     draw.rectangle((sidebar_x, 0, PAGE_W, PAGE_H), fill=SIDEBAR_BG)
     draw.line((sidebar_x, 20, sidebar_x, PAGE_H - 20), fill=DIVIDER, width=2)
@@ -268,12 +329,14 @@ def make_sheet_page(sheet_img_path: Path, sheet_name: str, logo_path: Path | Non
         logo = Image.open(logo_path).convert("RGBA")
         logo.thumbnail((120, 120), Image.LANCZOS)
         logo_x = sidebar_x + (SIDEBAR_W - logo.width) // 2
-        page.alpha_composite(logo, (logo_x, 35))
+        page = paste_transparent(page, logo, (logo_x, 35))
+        draw = ImageDraw.Draw(page)
 
     if show_sheet_name:
         font = load_font(18, bold=True)
         text_area_w = SIDEBAR_W - 16
-        lines = fit_text_lines(draw, "Nitty Gritty" if sheet_name == "NittyGrittySheet" else sheet_name, font, text_area_w)
+        label = "Nitty Gritty" if sheet_name == "NittyGrittySheet" else sheet_name
+        lines = fit_text_lines(draw, label, font, text_area_w)
         y = 180
         for line in lines:
             bbox = draw.textbbox((0, 0), line, font=font)
@@ -281,7 +344,7 @@ def make_sheet_page(sheet_img_path: Path, sheet_name: str, logo_path: Path | Non
             draw.text((sidebar_x + (SIDEBAR_W - line_w) / 2, y), line, fill=TITLE_COLOR, font=font)
             y += 28
 
-    shot = Image.open(sheet_img_path).convert("RGB")
+    shot = flatten_to_rgb(Image.open(sheet_img_path))
     scale = min(CONTENT_W / shot.width, CONTENT_H / shot.height)
     new_size = (int(shot.width * scale), int(shot.height * scale))
     shot = shot.resize(new_size, Image.LANCZOS)
@@ -292,7 +355,14 @@ def make_sheet_page(sheet_img_path: Path, sheet_name: str, logo_path: Path | Non
 
 
 def build_pdf(page_images: list[Image.Image], output_pdf: Path) -> Path:
-    rgb_pages = [img.convert("RGB") for img in page_images]
+    """Save pages as a PDF after forcing every page into RGB mode.
+
+    This fixes Pillow's "image has wrong mode" error caused by transparent PNGs
+    or palette images being passed to the PDF writer.
+    """
+    if not page_images:
+        raise ValueError("No pages were generated for the PDF.")
+    rgb_pages = [flatten_to_rgb(img) for img in page_images]
     first, rest = rgb_pages[0], rgb_pages[1:]
     first.save(output_pdf, "PDF", resolution=180.0, save_all=True, append_images=rest)
     return output_pdf
@@ -348,7 +418,7 @@ def convert_excel_to_pdf(
         pdf_path = convert_to_pdf(prepared_xlsx, tmpdir / "rendered_pdf", soffice_path)
         page_images = pdf_to_images(pdf_path, tmpdir / "sheet_pages", dpi=dpi)
         if len(page_images) < len(rendered_sheet_names):
-            raise RuntimeError(f"Expected {len(rendered_sheet_names)} pages, but LibreOffice rendered only {len(page_images)}.")
+            raise RuntimeError(f"Expected {len(rendered_sheet_names)} pages, but rendered only {len(page_images)}.")
 
         screenshot_paths = []
         for idx, img_path in enumerate(page_images[:len(rendered_sheet_names)], start=1):
@@ -365,7 +435,7 @@ def convert_excel_to_pdf(
         final_pages = []
         if intro_template:
             intro = extract_intro_page(intro_template, tmpdir, soffice_path)
-            intro = intro.resize((PAGE_W, PAGE_H), Image.LANCZOS)
+            intro = flatten_to_rgb(intro.resize((PAGE_W, PAGE_H), Image.LANCZOS))
             final_pages.append(intro)
         else:
             final_pages.append(create_generated_intro_page(title, logo_path))
@@ -385,7 +455,7 @@ def convert_excel_to_pdf(
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
     st.title("📄 Excel Screenshot to PDF Builder")
-    st.caption("Upload an Excel workbook and export worksheet screenshots into a PDF. No chart rebuilding — the worksheet screenshot stays in the Excel-rendered style.")
+    st.caption("Upload an Excel workbook and export worksheet screenshots into a PDF. No chart rebuilding — charts stay in the Excel-rendered style.")
 
     with st.sidebar:
         st.header("Settings")
@@ -437,21 +507,11 @@ def main() -> None:
                     margins=margins,
                 )
             st.success("PDF created successfully.")
-            st.download_button(
-                "Download PDF",
-                data=pdf_bytes,
-                file_name=pdf_name,
-                mime="application/pdf",
-            )
-            st.download_button(
-                "Download ZIP",
-                data=zip_bytes,
-                file_name=pdf_name.replace('.pdf', '.zip'),
-                mime="application/zip",
-            )
+            st.download_button("Download PDF", data=pdf_bytes, file_name=pdf_name, mime="application/pdf")
+            st.download_button("Download ZIP", data=zip_bytes, file_name=pdf_name.replace(".pdf", ".zip"), mime="application/zip")
         except Exception as exc:
             st.error(str(exc))
-            st.caption("Make sure LibreOffice is available locally or via packages.txt on Streamlit Cloud.")
+            st.caption("If this is a dependency error, make sure packages.txt includes both libreoffice and poppler-utils. If it mentions image mode, update to this RGB-fixed version of the app.")
 
 
 if __name__ == "__main__":

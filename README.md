@@ -1,33 +1,47 @@
-# Excel Screenshot to PDF Dashboard App
+# Excel Screenshot to PDF App
 
-A Streamlit app that turns an uploaded Excel workbook into a screenshot-style PDF.
+This Streamlit app renders an uploaded Excel workbook as screenshot-style PDF pages.
+It does not rebuild charts. LibreOffice renders the workbook, so chart formatting, slanted dates, fonts, sizes, and tables stay as close as possible to the Excel workbook.
 
-## What it does
+## What changed in this version
 
-1. Upload an `.xlsx` workbook.
-2. Optionally upload a `.pptx` file to reuse slide 1 as the intro page.
-3. LibreOffice renders each worksheet to PDF.
-4. The app converts each worksheet page into an image.
-5. It places each worksheet screenshot onto a PDF page with a right-side BYU Marriott logo bar.
-6. The worksheet image itself is not rebuilt or redrawn, so the chart labels and slanted dates stay in the Excel/LibreOffice screenshot style.
+- Uses LibreOffice to export Excel/PPTX to PDF.
+- Uses Poppler `pdftoppm` to turn PDF pages into images.
+- Fixes Pillow `image has wrong mode` errors by flattening all transparent/palette images to RGB before PDF export.
+- Supports optional logo upload and optional PowerPoint intro slide.
 
-## Files to upload to GitHub
+## GitHub / Streamlit Cloud files
 
-- `app.py`
-- `requirements.txt`
-- `packages.txt`
-- `.streamlit/config.toml`
-- `assets/default_logo.png`
+Your repo should include:
 
-## Local run
+```text
+app.py
+requirements.txt
+packages.txt
+.streamlit/config.toml
+assets/default_logo.png
+```
+
+## packages.txt
+
+```text
+libreoffice
+poppler-utils
+```
+
+## requirements.txt
+
+```text
+streamlit>=1.36.0
+openpyxl>=3.1.2
+Pillow>=10.0.0
+```
+
+## Run locally
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-You also need LibreOffice installed locally.
-
-## Streamlit Cloud
-
-`packages.txt` installs LibreOffice on Streamlit Cloud.
+You also need LibreOffice and Poppler installed locally.
