@@ -8,6 +8,12 @@ import zipfile
 from pathlib import Path
 from datetime import date, datetime
 from numbers import Number
+import math
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 
 import fitz  # PyMuPDF
 import streamlit as st
@@ -277,6 +283,7 @@ def extend_charts_to_latest_available_date(wb, cap_at_today: bool = False) -> tu
                 tx_ref = getattr(tx, "strRef", None) if tx is not None else None
                 clear_chart_reference_cache(tx_ref)
 
+    normalize_weekly_chart_axes(wb)
     return updates, newest_date_seen
 
 def prepare_workbook_for_rendering(
@@ -598,6 +605,353 @@ def make_zip(file_path: Path, zip_path: Path) -> Path:
     return zip_path
 
 
+
+
+def set_weekly_chart_axis_to_show_latest_label(chart) -> None:
+    """Ask Excel/LibreOffice to draw all weekly category tick labels.
+
+    LibreOffice sometimes extends the chart data but still auto-skips the newest
+    x-axis label. This makes the final weekly pull, such as 5/22/2026, appear
+    on the axis instead of looking like the old chart stopped at 5/15/2026.
+    """
+    try:
+        chart.x_axis.tickLblSkip = 1
+        chart.x_axis.tickMarkSkip = 1
+        chart.x_axis.noMultiLvlLbl = False
+    except Exception:
+        pass
+
+
+def is_weekly_horizontal_chart(chart) -> bool:
+    for series in getattr(chart, "series", []):
+        cat = getattr(series, "cat", None)
+        if cat is None:
+            continue
+        for ref in (getattr(cat, "strRef", None), getattr(cat, "numRef", None)):
+            if ref and getattr(ref, "f", None) and get_horizontal_range_parts(ref.f):
+                return True
+    return False
+
+
+def normalize_weekly_chart_axes(wb) -> None:
+    for ws in wb.worksheets:
+        for chart in getattr(ws, "_charts", []):
+            if is_weekly_horizontal_chart(chart):
+                set_weekly_chart_axis_to_show_latest_label(chart)
+
+
+def parse_numeric(value) -> float | None:
+    if isinstance(value, Number):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text or text in {"-", "--", "—"}:
+            return None
+        is_percent = text.endswith("%")
+        if is_percent:
+            text = text[:-1].strip()
+        try:
+            parsed = float(text)
+            return parsed / 100 if is_percent else parsed
+        except ValueError:
+            return None
+    return None
+
+
+def find_weekly_block_rows(wb, sheet_name: str) -> tuple[int, int, int, dict[str, int]] | None:
+    """Return date/value rows for this dashboard's weekly charts.
+
+    The placement dashboards store weekly chart data in NittyGrittySheet.
+    For MSB, the block begins under "2026 MSB Weekly Placement". For each
+    major, the block begins at a row whose first cell matches the worksheet name.
+    """
+    if "NittyGrittySheet" not in wb.sheetnames or sheet_name == "NittyGrittySheet":
+        return None
+
+    ws = wb["NittyGrittySheet"]
+
+    if sheet_name == "MSB Full-Time Dashboard":
+        for row in range(1, ws.max_row + 1):
+            value = ws.cell(row=row, column=1).value
+            if isinstance(value, str) and "MSB Weekly Placement" in value:
+                return (
+                    row + 1,
+                    row + 2,
+                    row + 4,
+                    {
+                        "Accepted an offer": row + 5,
+                        "Actively seeking": row + 6,
+                        "Not Reported": row + 8,
+                    },
+                )
+        # Fallback for the known BYU Marriott dashboard layout.
+        return (23, 24, 26, {"Accepted an offer": 27, "Actively seeking": 28, "Not Reported": 30})
+
+    for row in range(1, ws.max_row + 1):
+        value = ws.cell(row=row, column=1).value
+        if isinstance(value, str) and value.strip() == sheet_name:
+            return (
+                row + 1,
+                row + 2,
+                row + 4,
+                {
+                    "Accepted an offer": row + 5,
+                    "Actively seeking": row + 6,
+                    "Not Reported": row + 8,
+                },
+            )
+
+    return None
+
+
+def extract_horizontal_weekly_series(
+    ws,
+    date_row: int,
+    value_row: int,
+    fallback_date_row: int | None = None,
+) -> tuple[list[date], list[float]]:
+    """Extract a date/value series across columns B:last.
+
+    If a status date row was not copied forward but the value row has newer
+    values, fallback_date_row lets the app borrow the matching date labels from
+    the placement date row. This prevents stale chart screenshots when future
+    weekly columns exist but one date row was not extended correctly.
+    """
+    dates: list[date] = []
+    values: list[float] = []
+    max_col = ws.max_column
+
+    for col in range(2, max_col + 1):
+        current_date = parse_excel_date(ws.cell(row=date_row, column=col).value)
+        if current_date is None and fallback_date_row is not None:
+            current_date = parse_excel_date(ws.cell(row=fallback_date_row, column=col).value)
+        if current_date is None:
+            continue
+
+        current_value = parse_numeric(ws.cell(row=value_row, column=col).value)
+        if current_value is None:
+            continue
+
+        dates.append(current_date)
+        values.append(current_value)
+
+    # Sort and dedupe by date, keeping the last value for duplicate dates.
+    deduped: dict[date, float] = {}
+    for d, v in zip(dates, values):
+        deduped[d] = v
+    sorted_items = sorted(deduped.items(), key=lambda item: item[0])
+    return [item[0] for item in sorted_items], [item[1] for item in sorted_items]
+
+
+
+
+def tail_weekly_series(
+    dates: list[date],
+    values: list[float | None],
+    max_points: int,
+) -> tuple[list[date], list[float | None]]:
+    """Return the newest date plus the previous dates.
+
+    This is intentionally based on the actual uploaded workbook data, not a
+    hardcoded date. If the workbook contains 6/5/2026, the returned window ends
+    on 6/5/2026. If a future workbook contains 6/12/2026, it ends there.
+    """
+    pairs: dict[date, float | None] = {}
+    for d, v in zip(dates, values):
+        pairs[d] = v
+    items = sorted(pairs.items(), key=lambda item: item[0])
+    if max_points and max_points > 0:
+        items = items[-max_points:]
+    return [d for d, _ in items], [v for _, v in items]
+
+
+def series_to_date_value_map(dates: list[date], values: list[float]) -> dict[date, float]:
+    mapped: dict[date, float] = {}
+    for d, v in zip(dates, values):
+        mapped[d] = v
+    return mapped
+
+
+def newest_date_window(date_lists: list[list[date]], max_points: int) -> list[date]:
+    """Build one shared x-axis ending at the newest date found."""
+    all_dates = sorted({d for dates in date_lists for d in dates})
+    if max_points and max_points > 0:
+        all_dates = all_dates[-max_points:]
+    return all_dates
+
+def make_tick_indices(total_points: int, max_ticks: int = 12) -> list[int]:
+    if total_points <= max_ticks:
+        return list(range(total_points))
+    step = max(1, math.ceil(total_points / (max_ticks - 1)))
+    indices = list(range(0, total_points, step))
+    if indices[-1] != total_points - 1:
+        indices.append(total_points - 1)
+    return sorted(set(indices))
+
+
+def date_label(d: date) -> str:
+    return f"{d.month}/{d.day}/{d.year}"
+
+
+def render_rebuilt_line_chart(
+    output_path: Path,
+    dates: list[date],
+    series: dict[str, list[float | None]],
+    title: str,
+    y_label: str,
+    percent_axis: bool,
+    width_px: int,
+    height_px: int,
+) -> Path:
+    dpi = 160
+    fig_w = max(width_px / dpi, 3.0)
+    fig_h = max(height_px / dpi, 1.8)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+
+    x = list(range(len(dates)))
+    for label, values in series.items():
+        # Matplotlib will leave a gap for missing values, but the x-axis will
+        # still include the newest workbook date.
+        ax.plot(x, values, marker="o", linewidth=2.2, markersize=4.2, label=label)
+
+    tick_indices = make_tick_indices(len(dates), max_ticks=11)
+    ax.set_xticks(tick_indices)
+    ax.set_xticklabels([date_label(dates[i]) for i in tick_indices], rotation=45, ha="right", fontsize=7.5)
+    if dates:
+        ax.set_xlim(-0.5, len(dates) - 0.5)
+    ax.set_title(title, fontsize=12, color="#555555", pad=8)
+    ax.set_ylabel(y_label, fontsize=8.5, color="#555555")
+    ax.grid(axis="y", alpha=0.28)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(axis="y", labelsize=7.5)
+
+    if percent_axis:
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0%}"))
+        all_values = [v for values in series.values() for v in values if v is not None]
+        if all_values:
+            top = max(max(all_values) * 1.15, 0.10)
+            ax.set_ylim(0, min(max(top, 0.10), 1.0))
+    else:
+        all_values = [v for values in series.values() for v in values if v is not None]
+        if all_values:
+            top = max(all_values) * 1.18
+            ax.set_ylim(0, top if top > 0 else 1)
+
+    if len(series) > 1:
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.25), ncol=min(3, len(series)), fontsize=7, frameon=False)
+
+    fig.tight_layout(pad=1.0)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, facecolor="white", bbox_inches="tight", pad_inches=0.08)
+    plt.close(fig)
+    return output_path
+
+
+def paste_chart(image: Image.Image, chart_path: Path, box: tuple[int, int, int, int]) -> None:
+    left, top, right, bottom = box
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    chart = Image.open(chart_path).convert("RGB").resize((width, height), Image.LANCZOS)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(box, fill="white", outline=(225, 225, 225), width=1)
+    image.paste(chart, (left, top))
+
+
+def rebuild_weekly_charts_on_sheet_image(
+    image_path: Path,
+    output_path: Path,
+    prepared_workbook_path: Path,
+    sheet_name: str,
+    working_dir: Path,
+    weekly_window_points: int = 10,
+) -> Path:
+    """Replace stale Excel-rendered weekly charts with freshly drawn charts.
+
+    This is the important fix for future weekly pulls. Excel/LibreOffice may
+    show a chart that visually stops at an older tick label even after formulas
+    are extended. This function reads the newest weekly data directly from
+    NittyGrittySheet and pastes newly rendered chart images over the two top
+    weekly charts, guaranteeing the newest workbook date appears on the x-axis.
+    """
+    wb = load_workbook(prepared_workbook_path, data_only=True)
+    rows = find_weekly_block_rows(wb, sheet_name)
+    if rows is None:
+        image_path.replace(output_path) if image_path != output_path else None
+        return output_path if output_path.exists() else image_path
+
+    date_row, placement_value_row, status_date_row, status_rows = rows
+    ws = wb["NittyGrittySheet"]
+
+    placement_dates, placement_values = extract_horizontal_weekly_series(ws, date_row, placement_value_row)
+    placement_dates, placement_values = tail_weekly_series(placement_dates, placement_values, weekly_window_points)
+    if len(placement_dates) < 2:
+        image_path.replace(output_path) if image_path != output_path else None
+        return output_path if output_path.exists() else image_path
+
+    status_maps: dict[str, dict[date, float]] = {}
+    status_date_lists: list[list[date]] = []
+    for label, row in status_rows.items():
+        dts, vals = extract_horizontal_weekly_series(ws, status_date_row, row, fallback_date_row=date_row)
+        if len(dts) >= 2:
+            status_maps[label] = series_to_date_value_map(dts, vals)
+            status_date_lists.append(dts)
+
+    status_dates = newest_date_window(status_date_lists, weekly_window_points) if status_date_lists else []
+    status_series: dict[str, list[float | None]] = {
+        label: [mapped.get(d) for d in status_dates]
+        for label, mapped in status_maps.items()
+    }
+
+    image = Image.open(image_path).convert("RGB")
+    width, height = image.size
+
+    # These boxes match the BYU Marriott placement dashboard screenshot layout.
+    left_chart_box = (
+        int(width * 0.018),
+        int(height * 0.058),
+        int(width * 0.490),
+        int(height * 0.455),
+    )
+    right_chart_box = (
+        int(width * 0.510),
+        int(height * 0.058),
+        int(width * 0.982),
+        int(height * 0.455),
+    )
+
+    chart_dir = working_dir / "rebuilt_weekly_charts"
+    placement_chart = chart_dir / f"{sanitize_filename(sheet_name)}_placement.png"
+    render_rebuilt_line_chart(
+        placement_chart,
+        placement_dates,
+        {"% Placed": placement_values},
+        "Weekly 2026 Placement Trend" if sheet_name == "MSB Full-Time Dashboard" else "Weekly Placement Trend",
+        "% of Seeking Students Placed",
+        True,
+        left_chart_box[2] - left_chart_box[0],
+        left_chart_box[3] - left_chart_box[1],
+    )
+    paste_chart(image, placement_chart, left_chart_box)
+
+    if status_dates and status_series:
+        status_chart = chart_dir / f"{sanitize_filename(sheet_name)}_status.png"
+        render_rebuilt_line_chart(
+            status_chart,
+            status_dates,
+            status_series,
+            "Weekly 2026 Search Status" if sheet_name == "MSB Full-Time Dashboard" else "Weekly Search Status",
+            "# of Students",
+            False,
+            right_chart_box[2] - right_chart_box[0],
+            right_chart_box[3] - right_chart_box[1],
+        )
+        paste_chart(image, status_chart, right_chart_box)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path, quality=95, optimize=True)
+    return output_path
+
 def convert_excel_to_pptx(
     uploaded_excel,
     selected_sheets: list[str],
@@ -613,6 +967,8 @@ def convert_excel_to_pptx(
     margins: float,
     auto_extend_latest_date: bool,
     cap_chart_dates_at_today: bool,
+    rebuild_weekly_charts: bool,
+    weekly_window_points: int,
 ) -> tuple[bytes, bytes, str]:
     soffice_path = find_soffice()
     if not soffice_path:
@@ -661,11 +1017,29 @@ def convert_excel_to_pptx(
 
         final_images = []
         for index, img_path in enumerate(page_images[: len(rendered_sheet_names)], start=1):
+            sheet_name = rendered_sheet_names[index - 1]
             working = img_path
             if crop_pages:
                 cropped = tmpdir / "cropped" / f"sheet_{index:02d}.png"
                 cropped.parent.mkdir(exist_ok=True)
                 working = crop_white_space(working, cropped)
+
+            if rebuild_weekly_charts:
+                rebuilt = tmpdir / "rebuilt_sheets" / f"sheet_{index:02d}.png"
+                rebuilt.parent.mkdir(exist_ok=True)
+                try:
+                    working = rebuild_weekly_charts_on_sheet_image(
+                        working,
+                        rebuilt,
+                        prepared_xlsx,
+                        sheet_name,
+                        tmpdir,
+                        weekly_window_points=weekly_window_points,
+                    )
+                except Exception:
+                    # Keep the normal Excel screenshot if a workbook does not use
+                    # the BYU Marriott NittyGrittySheet dashboard layout.
+                    pass
 
             optimized = tmpdir / "optimized" / f"sheet_{index:02d}.jpg"
             optimized.parent.mkdir(exist_ok=True)
@@ -759,6 +1133,19 @@ def main() -> None:
             value=False,
             help="Leave this off for normal use. Turn it on only if your workbook contains blank future placeholder dates that should not appear yet.",
         )
+        rebuild_weekly_charts = st.checkbox(
+            "Rebuild weekly charts from NittyGrittySheet",
+            value=True,
+            help="Recommended. Forces weekly placement and search-status charts to end on the newest date in the uploaded workbook instead of relying on stale Excel chart rendering.",
+        )
+        weekly_window_points = st.slider(
+            "Weekly chart window: newest date plus previous pulls",
+            min_value=6,
+            max_value=16,
+            value=10,
+            step=1,
+            help="The rebuilt weekly charts will always include the newest workbook date and this many total weekly pulls. Use 10 for roughly the last two months.",
+        )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -813,6 +1200,8 @@ def main() -> None:
                     margins=margins,
                     auto_extend_latest_date=auto_extend_latest_date,
                     cap_chart_dates_at_today=cap_chart_dates_at_today,
+                    rebuild_weekly_charts=rebuild_weekly_charts,
+                    weekly_window_points=weekly_window_points,
                 )
 
             st.success("PowerPoint created successfully.")
